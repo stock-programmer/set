@@ -1,0 +1,222 @@
+{
+  "schema_version": "shot-acceptance/1",
+  "project_sha256": "056aec4aeb2a07cfd1f819da06eeb9869d678d052a7ca34891932f9bd3685094",
+  "shot_id": "S002",
+  "shot_sha256": "b5782bfd140dead0890b8a3a07b521af66e88718dba945da98bdb6cd93deba2c",
+  "scope": "shot_and_declared_regression_dependencies",
+  "input_versions": {
+    "script": 1,
+    "char:lin": 1,
+    "char:chen": 1,
+    "scene:office": 1,
+    "prop:key": 1,
+    "costume:coat": 1
+  },
+  "entity_snapshots": {
+    "scene:office": {
+      "kind": "scene",
+      "version": 1,
+      "canonical": {
+        "name": "旧办公室",
+        "coordinate_frame": "房间世界坐标，不是画面左右",
+        "layout": "西墙门、北墙窗、中央木桌"
+      },
+      "references": [],
+      "source_refs": [
+        {
+          "source_id": "SET003",
+          "quote": "场景是旧办公室：西墙门、北墙窗、中央木桌。方位使用房间世界坐标，不是画面左右；换机位不能改变房间实际布局。"
+        }
+      ]
+    },
+    "char:lin": {
+      "kind": "character",
+      "version": 1,
+      "canonical": {
+        "name": "林岚",
+        "identity": "成年女性，短黑发，左眉有浅疤",
+        "voice": "待选定声音参考"
+      },
+      "references": [],
+      "source_refs": [
+        {
+          "source_id": "SET001",
+          "quote": "林岚是成年女性，短黑发，左眉有浅疤。她的声音参考待选定。"
+        }
+      ]
+    },
+    "char:chen": {
+      "kind": "character",
+      "version": 1,
+      "canonical": {
+        "name": "陈默",
+        "identity": "成年男性，卷发，戴细框眼镜",
+        "voice": "待选定声音参考"
+      },
+      "references": [],
+      "source_refs": [
+        {
+          "source_id": "SET002",
+          "quote": "陈默是成年男性，卷发，戴细框眼镜。他的声音参考待选定。"
+        }
+      ]
+    },
+    "prop:key": {
+      "kind": "prop",
+      "version": 1,
+      "canonical": {
+        "name": "铜钥匙",
+        "appearance": "一把铜钥匙，红色方形钥匙牌"
+      },
+      "references": [],
+      "source_refs": [
+        {
+          "source_id": "SET004",
+          "quote": "道具是一把铜钥匙，红色方形钥匙牌；全段只有这一把钥匙。"
+        }
+      ]
+    },
+    "costume:coat": {
+      "kind": "costume",
+      "version": 1,
+      "canonical": {
+        "name": "林岚米色风衣",
+        "appearance": "米色双排扣风衣"
+      },
+      "references": [],
+      "source_refs": [
+        {
+          "source_id": "SET005",
+          "quote": "林岚穿米色双排扣风衣，全段不换装。"
+        }
+      ]
+    }
+  },
+  "expected_state_before": {
+    "char:lin.costume": "costume:coat",
+    "char:lin.location": "scene:office",
+    "char:chen.location": "scene:office",
+    "char:chen.knows_key_origin": false,
+    "prop:key.holder": "char:lin",
+    "scene:office.door_wall": "west",
+    "scene:office.time_of_day": "night"
+  },
+  "expected_state_after": {
+    "char:lin.costume": "costume:coat",
+    "char:lin.location": "scene:office",
+    "char:chen.location": "scene:office",
+    "char:chen.knows_key_origin": false,
+    "prop:key.holder": "char:chen",
+    "scene:office.door_wall": "west",
+    "scene:office.time_of_day": "night"
+  },
+  "requirements": [
+    {
+      "criterion_id": "file_decode",
+      "kind": "technical",
+      "required": true,
+      "expectation": "整个视频文件可严格解码",
+      "check": "decode"
+    },
+    {
+      "criterion_id": "duration",
+      "kind": "technical",
+      "required": true,
+      "expectation": "时长符合固定目标",
+      "check": "duration",
+      "expected": 8,
+      "tolerance_s": 0.25
+    },
+    {
+      "criterion_id": "resolution",
+      "kind": "technical",
+      "required": true,
+      "expectation": "分辨率符合固定目标",
+      "check": "resolution",
+      "width": 720,
+      "height": 1280
+    },
+    {
+      "criterion_id": "character_identity",
+      "kind": "reference_comparison",
+      "required": true,
+      "expectation": "角色与已批准参考一致；文字外貌不能替代身份参考"
+    },
+    {
+      "criterion_id": "scene_geometry",
+      "kind": "reference_and_camera",
+      "required": true,
+      "expectation": "场景布局与参考、世界坐标及机位一致"
+    },
+    {
+      "criterion_id": "action_sequence",
+      "kind": "continuous_video",
+      "required": true,
+      "expectation": "连续画面确实表现镜头动作，不能仅凭首尾推断：手部近景。林岚把铜钥匙放进陈默手中，陈默合拢手指。"
+    },
+    {
+      "criterion_id": "start_end_state",
+      "kind": "continuous_video",
+      "required": true,
+      "expectation": "实际开始与结束状态符合预期，且能确认相关角色与道具"
+    },
+    {
+      "criterion_id": "sampled_prop_appearance",
+      "kind": "sampled_visual",
+      "required": true,
+      "expectation": "只判断引用帧中可见道具的外观是否符合文字设定，遮挡/看不清则UNKNOWN：{\"prop:key\": {\"name\": \"铜钥匙\", \"appearance\": \"一把铜钥匙，红色方形钥匙牌\"}}"
+    },
+    {
+      "criterion_id": "sampled_costume_appearance",
+      "kind": "sampled_visual",
+      "required": true,
+      "expectation": "只判断引用帧中可见服装是否符合文字设定，不能据此判断全程不变：{\"costume:coat\": {\"name\": \"林岚米色风衣\", \"appearance\": \"米色双排扣风衣\"}}"
+    },
+    {
+      "criterion_id": "continuity:S001->S002",
+      "kind": "sequence_review",
+      "required": true,
+      "expectation": "复查 S001 与 S002 的动作、道具、场景和声音衔接",
+      "shot_ids": [
+        "S001",
+        "S002"
+      ]
+    },
+    {
+      "criterion_id": "continuity:S002->S003",
+      "kind": "sequence_review",
+      "required": true,
+      "expectation": "复查 S002 与 S003 的动作、道具、场景和声音衔接",
+      "shot_ids": [
+        "S002",
+        "S003"
+      ]
+    }
+  ],
+  "regression": {
+    "changed_shot_id": "S002",
+    "shot_checks": [
+      "S002",
+      "S003"
+    ],
+    "context_shot_ids": [
+      "S001",
+      "S002",
+      "S003"
+    ],
+    "continuity_edges": [
+      [
+        "S001",
+        "S002"
+      ],
+      [
+        "S002",
+        "S003"
+      ]
+    ],
+    "basis": "declared continuity_from; no edited timeline exists yet",
+    "checks_executed": false
+  },
+  "creative_review": "UNKNOWN",
+  "audio_content_review": "UNKNOWN"
+}

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#FFF5DF">
+  <title>片场 · 短剧制作工作台</title>
+  <link rel="icon" type="image/svg+xml" href="/pianchang.svg">
+  <link rel="stylesheet" href="/workbench.css">
+  <script src="/workbench.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#workspace">跳到制作区</a>
+  <div class="studio-shell">
+    <aside class="project-rail" aria-label="工程导航">
+      <a class="brand" href="/" aria-label="片场工作台首页">
+        <img class="brand-mark" src="/pianchang.svg" alt="" width="40" height="40">
+        <span><strong>片场</strong><small>短剧制作工作台</small></span>
+      </a>
+      <div class="rail-caption"><span>我的制作</span><span class="quiet" id="project-count">—</span></div>
+      <button class="button button-new" id="new-project" type="button"><span aria-hidden="true">＋</span> 新建故事</button>
+      <button class="button trace-nav-button" id="open-traces" type="button"><span aria-hidden="true">⌁</span> Trace 调试台</button>
+      <a class="button trace-nav-button" href="/collaborations"><span aria-hidden="true">⇄</span> Agent 协作记录</a>
+      <nav class="project-list" id="project-list" aria-label="工程列表"><p class="muted list-loading">正在读取工程…</p></nav>
+      <div class="rail-bottom">
+        <div class="local-status"><span class="status-dot"></span><span>本机工作空间</span></div>
+        <p>故事、候选与证据<br>都留在当前项目目录</p>
+      </div>
+    </aside>
+
+    <div class="studio-body">
+      <header class="topbar">
+        <div class="breadcrumb"><span>制作工作台</span><span aria-hidden="true">/</span><strong id="breadcrumb-title">我的故事</strong></div>
+        <div class="topbar-actions"><span class="key-status status-pill neutral" id="key-status">正在检查配置</span><button class="button button-quiet guide-toggle" id="guide-toggle" type="button" aria-expanded="false" aria-controls="quick-guide">使用指南 <span aria-hidden="true">↗</span></button></div>
+      </header>
+      <div class="quick-guide" id="quick-guide" hidden>
+        <div><strong>从一句创意，到可以播放的预览片</strong><p>点击「新建故事」交给剧本 Agent。选中故事后，「四个制作阶段」会列出实际产物、保存位置及下一步使用者。</p></div>
+        <ol><li>创作剧本</li><li>Agent 制作并自检资产</li><li>自动选用并关联镜头</li><li>视频 Agent 制作、验收与修复</li><li>验收通过后人工预览</li></ol>
+        <div><strong>在「四个制作阶段」中交接</strong><p>在「共享资产」查看各镜头使用的图片、声音和自检结果。不满意时填写修改要求，点击「重新生成」。在「视频制作」查看拍摄计划和自动修复额度，开始后由 Agent 自主验收、修复和复验；在制作动态中查看每轮问题与处理记录。</p></div>
+        <p>执行期间，模型会根据工具结果决定下一步。在当前故事的「制作动态」中查看进度，点击「查看 Trace」核对模型请求与工具结果；结束后查看执行报告和停止原因。需要停止时，点击「停止后续动作」，当前调用返回后生效。</p>
+        <p class="guide-note">视频生成、自动修复重拍、模型决策和视觉观察按实际调用计费。在「视频制作」查看自动验收与修复记录，全部必过项通过后进入「人工预览」。</p>
+      </div>
+      <div class="connection-banner" id="connection-banner" role="status" hidden></div>
+      <div class="workspace-layout">
+        <main class="workspace" id="workspace" tabindex="-1">
+          <div class="workspace-heading">
+            <div><span class="eyebrow" id="workspace-eyebrow">YOUR NEXT STORY</span><h1 id="project-title">一个故事，从这里开拍。</h1><p class="workspace-subtitle" id="project-subtitle">让创意成为剧本，让每一个镜头都有据可查。</p></div>
+            <div class="project-meta" id="project-meta"></div>
+          </div>
+          <nav class="workflow-tabs production-nav" aria-label="制作阶段" id="workflow-tabs">
+            <button class="workflow-tab active" type="button" data-step="story" aria-current="step"><strong>剧本与分镜</strong><small data-phase-status="story">创作与发布</small></button>
+            <button class="workflow-tab" type="button" data-step="assets"><strong>共享资产</strong><small data-phase-status="assets">制作与自检</small></button>
+            <button class="workflow-tab" type="button" data-step="video"><strong>视频制作</strong><small data-phase-status="video">拍摄、验收与修复</small></button>
+            <button class="workflow-tab" type="button" data-step="review"><strong>人工预览</strong><small data-phase-status="review">验收通过后解锁</small></button>
+          </nav>
+          <div id="stage" class="stage" aria-busy="true"><div class="loading-state"><span class="spinner" aria-hidden="true"></span><p>正在打开工作空间</p></div></div>
+        </main>
+        <aside class="activity-rail" aria-label="后台任务与制作提示">
+          <div class="activity-heading"><div><span class="eyebrow">PRODUCTION LOG</span><h2>制作动态</h2></div><span class="activity-count" id="active-job-count">0</span></div>
+          <p class="activity-intro" id="activity-intro">当前故事的后台任务会在这里持续更新。</p>
+          <div id="job-list" class="job-list" aria-live="polite" aria-relevant="additions text"><div class="quiet-state"><span class="quiet-state-symbol" aria-hidden="true">◷</span><p>还没有任务</p><small>每一次创作，都从这里留下记录。</small></div></div>
+          <section class="production-note"><span class="note-line"></span><span class="eyebrow">A NOTE ON QUALITY</span><h3>自动验收通过，再进入人工预览。</h3><p>通过、失败、待补证据分别记录。任何必过条件未知，都不会被视为验收成功。</p><div class="status-legend"><span><i class="legend-dot pass"></i>通过</span><span><i class="legend-dot fail"></i>失败</span><span><i class="legend-dot unknown"></i>未知</span></div></section>
+          <div class="model-caption" id="model-caption">模型配置读取中</div>
+        </aside>
+      </div>
+    </div>
+  </div>
+  <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="false"></div>
+  <div class="sr-only" id="screen-reader-status" role="status" aria-live="polite"></div>
+</body>
+</html>

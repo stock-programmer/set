@@ -1,0 +1,397 @@
+{
+  "schema_version": "0.1",
+  "title": "最后一把钥匙：三镜头连续性实验",
+  "script_version": 1,
+  "timeline_mode": "chronological",
+  "entities": {
+    "char:lin": {
+      "kind": "character",
+      "version": 1,
+      "canonical": {
+        "name": "林岚",
+        "identity": "成年女性，短黑发，左眉有浅疤",
+        "voice": "待选定声音参考"
+      },
+      "references": [],
+      "source_refs": [
+        {
+          "source_id": "SET001",
+          "quote": "林岚是成年女性，短黑发，左眉有浅疤。她的声音参考待选定。"
+        }
+      ]
+    },
+    "char:chen": {
+      "kind": "character",
+      "version": 1,
+      "canonical": {
+        "name": "陈默",
+        "identity": "成年男性，卷发，戴细框眼镜",
+        "voice": "待选定声音参考"
+      },
+      "references": [],
+      "source_refs": [
+        {
+          "source_id": "SET002",
+          "quote": "陈默是成年男性，卷发，戴细框眼镜。他的声音参考待选定。"
+        }
+      ]
+    },
+    "scene:office": {
+      "kind": "scene",
+      "version": 1,
+      "canonical": {
+        "name": "旧办公室",
+        "coordinate_frame": "房间世界坐标，不是画面左右",
+        "layout": "西墙门、北墙窗、中央木桌"
+      },
+      "references": [],
+      "source_refs": [
+        {
+          "source_id": "SET003",
+          "quote": "场景是旧办公室：西墙门、北墙窗、中央木桌。方位使用房间世界坐标，不是画面左右；换机位不能改变房间实际布局。"
+        }
+      ]
+    },
+    "prop:key": {
+      "kind": "prop",
+      "version": 1,
+      "canonical": {
+        "name": "铜钥匙",
+        "appearance": "一把铜钥匙，红色方形钥匙牌"
+      },
+      "references": [],
+      "source_refs": [
+        {
+          "source_id": "SET004",
+          "quote": "道具是一把铜钥匙，红色方形钥匙牌；全段只有这一把钥匙。"
+        }
+      ]
+    },
+    "costume:coat": {
+      "kind": "costume",
+      "version": 1,
+      "canonical": {
+        "name": "林岚米色风衣",
+        "appearance": "米色双排扣风衣"
+      },
+      "references": [],
+      "source_refs": [
+        {
+          "source_id": "SET005",
+          "quote": "林岚穿米色双排扣风衣，全段不换装。"
+        }
+      ]
+    }
+  },
+  "facts": {
+    "char:lin.costume": {
+      "initial": "costume:coat",
+      "mutable": true,
+      "allowed": [
+        "costume:coat"
+      ],
+      "source_refs": [
+        {
+          "source_id": "SET005",
+          "quote": "林岚穿米色双排扣风衣，全段不换装。"
+        }
+      ]
+    },
+    "char:lin.location": {
+      "initial": "scene:office",
+      "mutable": true,
+      "allowed": [
+        "scene:office"
+      ],
+      "source_refs": [
+        {
+          "source_id": "SET006",
+          "quote": "本段发生在夜晚；林岚与陈默全程位于旧办公室。场景时间的记录可区分白天与夜晚。"
+        }
+      ]
+    },
+    "char:chen.location": {
+      "initial": "scene:office",
+      "mutable": true,
+      "allowed": [
+        "scene:office"
+      ],
+      "source_refs": [
+        {
+          "source_id": "SET006",
+          "quote": "本段发生在夜晚；林岚与陈默全程位于旧办公室。场景时间的记录可区分白天与夜晚。"
+        }
+      ]
+    },
+    "char:chen.knows_key_origin": {
+      "initial": false,
+      "mutable": true,
+      "allowed": [
+        false,
+        true
+      ],
+      "source_refs": [
+        {
+          "source_id": "SET008",
+          "quote": "陈默起初不知道钥匙的来源；本段没有人告诉他，拿到钥匙也不代表获知来源。"
+        }
+      ]
+    },
+    "prop:key.holder": {
+      "initial": "char:lin",
+      "mutable": true,
+      "allowed": [
+        "char:lin",
+        "char:chen",
+        "scene:office.table"
+      ],
+      "source_refs": [
+        {
+          "source_id": "SET007",
+          "quote": "钥匙起初由林岚持有；交接后由陈默持有。钥匙允许由林岚、陈默持有或放在办公室木桌上，但本段没有放到桌上的行动。"
+        }
+      ]
+    },
+    "scene:office.door_wall": {
+      "initial": "west",
+      "mutable": false,
+      "allowed": [
+        "west",
+        "east"
+      ],
+      "source_refs": [
+        {
+          "source_id": "SET009",
+          "quote": "办公室房门固定在西墙，不能通过剧情事件改到东墙。"
+        }
+      ]
+    },
+    "scene:office.time_of_day": {
+      "initial": "night",
+      "mutable": true,
+      "allowed": [
+        "night",
+        "day"
+      ],
+      "source_refs": [
+        {
+          "source_id": "SET006",
+          "quote": "本段发生在夜晚；林岚与陈默全程位于旧办公室。场景时间的记录可区分白天与夜晚。"
+        }
+      ]
+    }
+  },
+  "events": [
+    {
+      "id": "event:handover",
+      "reason": "林岚把铜钥匙交给陈默。陈默拿到钥匙，但还不知道来源。",
+      "requires": {
+        "prop:key.holder": "char:lin"
+      },
+      "changes": {
+        "prop:key.holder": "char:chen"
+      },
+      "source_refs": [
+        {
+          "source_id": "B002",
+          "quote": "手部近景。林岚把铜钥匙放进陈默手中，陈默合拢手指。林岚把铜钥匙交给陈默。陈默拿到钥匙，但还不知道来源。"
+        }
+      ]
+    }
+  ],
+  "shots": [
+    {
+      "id": "S001",
+      "duration_s": 6,
+      "scene_id": "scene:office",
+      "description": "中景。夜，旧办公室。林岚拿出铜钥匙，陈默看向她的手。",
+      "entity_ids": [
+        "char:lin",
+        "char:chen",
+        "prop:key",
+        "costume:coat"
+      ],
+      "input_versions": {
+        "script": 1,
+        "char:lin": 1,
+        "char:chen": 1,
+        "scene:office": 1,
+        "prop:key": 1,
+        "costume:coat": 1
+      },
+      "continuity_from": [],
+      "requires": {
+        "prop:key.holder": "char:lin",
+        "scene:office.time_of_day": "night"
+      },
+      "event_ids": [],
+      "expected_after": {
+        "prop:key.holder": "char:lin",
+        "char:chen.knows_key_origin": false
+      },
+      "source_refs": [
+        {
+          "source_id": "B001",
+          "quote": "中景。夜，旧办公室。林岚拿出铜钥匙，陈默看向她的手。钥匙仍由林岚持有，陈默不知道它的来源。"
+        }
+      ],
+      "episode_id": "EP001",
+      "script_scene_id": "SC001"
+    },
+    {
+      "id": "S002",
+      "duration_s": 8,
+      "scene_id": "scene:office",
+      "description": "手部近景。林岚把铜钥匙放进陈默手中，陈默合拢手指。",
+      "entity_ids": [
+        "char:lin",
+        "char:chen",
+        "prop:key",
+        "costume:coat"
+      ],
+      "input_versions": {
+        "script": 1,
+        "char:lin": 1,
+        "char:chen": 1,
+        "scene:office": 1,
+        "prop:key": 1,
+        "costume:coat": 1
+      },
+      "continuity_from": [
+        "S001"
+      ],
+      "requires": {
+        "prop:key.holder": "char:lin",
+        "char:lin.costume": "costume:coat"
+      },
+      "event_ids": [
+        "event:handover"
+      ],
+      "expected_after": {
+        "prop:key.holder": "char:chen"
+      },
+      "source_refs": [
+        {
+          "source_id": "B002",
+          "quote": "手部近景。林岚把铜钥匙放进陈默手中，陈默合拢手指。林岚把铜钥匙交给陈默。陈默拿到钥匙，但还不知道来源。"
+        }
+      ],
+      "episode_id": "EP001",
+      "script_scene_id": "SC001"
+    },
+    {
+      "id": "S003",
+      "duration_s": 8,
+      "scene_id": "scene:office",
+      "description": "陈默近景。他举起刚接到的铜钥匙，仍不知道它的来源。反打不能改变房间实际布局。",
+      "entity_ids": [
+        "char:chen",
+        "prop:key"
+      ],
+      "input_versions": {
+        "script": 1,
+        "char:chen": 1,
+        "scene:office": 1,
+        "prop:key": 1
+      },
+      "continuity_from": [
+        "S002"
+      ],
+      "requires": {
+        "prop:key.holder": "char:chen",
+        "char:chen.knows_key_origin": false,
+        "scene:office.door_wall": "west"
+      },
+      "event_ids": [],
+      "expected_after": {
+        "prop:key.holder": "char:chen"
+      },
+      "source_refs": [
+        {
+          "source_id": "B003",
+          "quote": "陈默近景。他举起刚接到的铜钥匙，仍不知道它的来源。反打不能改变房间实际布局。钥匙保持由陈默持有。"
+        }
+      ],
+      "episode_id": "EP001",
+      "script_scene_id": "SC001"
+    }
+  ],
+  "script_source": {
+    "sha256": "c579bb4a80e02cd5a7e358113ef49178e2f5227b03677c752afe87afb0475346",
+    "script": {
+      "schema_version": "screenplay/1",
+      "script_version": 1,
+      "idea": "用三镜头演示钥匙交接的剧情状态连续性，所有角色均为成年人。",
+      "title": "最后一把钥匙：三镜头连续性实验",
+      "logline": "夜晚的旧办公室里，林岚把带红色方形钥匙牌的铜钥匙交给陈默；陈默接过钥匙，却仍不知道它的来源。",
+      "outline": "林岚先拿出钥匙，随后将钥匙交到陈默手中，最后陈默举起刚收到的钥匙。三段行动按时间顺序发生于同一办公室，保持人物、服装、道具和房间实际布局不变。",
+      "setup": [
+        {
+          "id": "SET001",
+          "text": "林岚是成年女性，短黑发，左眉有浅疤。她的声音参考待选定。"
+        },
+        {
+          "id": "SET002",
+          "text": "陈默是成年男性，卷发，戴细框眼镜。他的声音参考待选定。"
+        },
+        {
+          "id": "SET003",
+          "text": "场景是旧办公室：西墙门、北墙窗、中央木桌。方位使用房间世界坐标，不是画面左右；换机位不能改变房间实际布局。"
+        },
+        {
+          "id": "SET004",
+          "text": "道具是一把铜钥匙，红色方形钥匙牌；全段只有这一把钥匙。"
+        },
+        {
+          "id": "SET005",
+          "text": "林岚穿米色双排扣风衣，全段不换装。"
+        },
+        {
+          "id": "SET006",
+          "text": "本段发生在夜晚；林岚与陈默全程位于旧办公室。场景时间的记录可区分白天与夜晚。"
+        },
+        {
+          "id": "SET007",
+          "text": "钥匙起初由林岚持有；交接后由陈默持有。钥匙允许由林岚、陈默持有或放在办公室木桌上，但本段没有放到桌上的行动。"
+        },
+        {
+          "id": "SET008",
+          "text": "陈默起初不知道钥匙的来源；本段没有人告诉他，拿到钥匙也不代表获知来源。"
+        },
+        {
+          "id": "SET009",
+          "text": "办公室房门固定在西墙，不能通过剧情事件改到东墙。"
+        }
+      ],
+      "episodes": [
+        {
+          "id": "EP001",
+          "title": "第一集：交接",
+          "scenes": [
+            {
+              "id": "SC001",
+              "title": "夜，旧办公室",
+              "beats": [
+                {
+                  "id": "B001",
+                  "text": "中景。夜，旧办公室。林岚拿出铜钥匙，陈默看向她的手。钥匙仍由林岚持有，陈默不知道它的来源。",
+                  "required": true
+                },
+                {
+                  "id": "B002",
+                  "text": "手部近景。林岚把铜钥匙放进陈默手中，陈默合拢手指。林岚把铜钥匙交给陈默。陈默拿到钥匙，但还不知道来源。",
+                  "required": true
+                },
+                {
+                  "id": "B003",
+                  "text": "陈默近景。他举起刚接到的铜钥匙，仍不知道它的来源。反打不能改变房间实际布局。钥匙保持由陈默持有。",
+                  "required": true
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

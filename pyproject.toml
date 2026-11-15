@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drama-agent-trace"
+version = "0.1.0"
+description = "Independent local Python tracing SDK with a persistent event store"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+models = ["litellm==1.109.1"]
+
+[project.scripts]
+agent-trace = "trace_system.__main__:main"
+
+[tool.setuptools]
+packages = ["trace_system"]
+
+[tool.setuptools.package-data]
+trace_system = ["README.md"]

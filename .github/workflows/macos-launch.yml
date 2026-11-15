@@ -1,0 +1,46 @@
+name: macOS ZIP launch
+
+on:
+  push:
+    branches: [main]
+    paths: &launcher_paths
+      - '启动片场.command'
+      - 'tools/*launch*'
+      - 'tools/*config*'
+      - 'tests/test_workbench_launcher.py'
+      - 'tests/test_macos_subtitle.py'
+      - 'pianchang/*subtitle*'
+      - 'pianchang/video_repair.py'
+      - 'pianchang/web_server.py'
+      - '.env.example'
+      - '.github/workflows/macos-launch.yml'
+  pull_request:
+    paths: *launcher_paths
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  launch:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Extract the source ZIP and test both launches
+        run: |
+          git archive --format=zip --output="$RUNNER_TEMP/set.zip" HEAD
+          package="$RUNNER_TEMP/片场 解压目录"
+          ditto -x -k "$RUNNER_TEMP/set.zip" "$package"
+          test -x "$package/启动片场.command"
+          cd "$package"
+          python -m unittest -v tests.test_workbench_launcher tests.test_macos_subtitle

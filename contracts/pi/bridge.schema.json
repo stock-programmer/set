@@ -1,0 +1,15 @@
+{
+  "$schema":"https://json-schema.org/draft/2020-12/schema",
+  "title":"drama-pi-bridge/1",
+  "description":"Private child-process messages. Tools use Python's actual schema catalog. These business envelopes do not replace trace_system.",
+  "type":"object",
+  "properties":{
+    "type":{"enum":["start","call","reply","steer","prompt","stop","close","fatal"]},
+    "id":{"type":"string"},
+    "method":{"enum":["ready","tool","event","settled"]},
+    "body":{"type":"object"},
+    "config":{"type":"object"},
+    "result":{},"error":{"type":"string"},"text":{"type":"string"}
+  },
+  "required":["type"],"additionalProperties":false
+}

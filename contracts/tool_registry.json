@@ -1,0 +1,183 @@
+{
+  "schema_version": "drama-tool-registry/1",
+  "checked_at": "2026-11-04",
+  "purpose": "Capability inventory for the repository, not an executable dispatcher or acceptance result.",
+  "availability_meanings": {
+    "implemented": "The limited capability stated here has a working Python or CLI entry point.",
+    "partial": "Only the explicitly listed subset is implemented; limitations remain unresolved.",
+    "planned": "No implementation entry point is provided by this repository."
+  },
+  "completion_policy": {
+    "statuses": ["PASS", "FAIL", "UNKNOWN"],
+    "required_fail_blocks_completion": true,
+    "required_unknown_blocks_completion": true,
+    "model_verdict_is_acceptance": false,
+    "api_success_is_acceptance": false,
+    "sparse_frames_prove_continuity": false,
+    "generation_job_binding_required": true,
+    "contract_policy_cannot_be_weakened": true,
+    "scope": "Frozen shot contract and declared regression dependencies; not whole-episode acceptance."
+  },
+  "tools": [
+    {
+      "name": "read_project",
+      "availability": "implemented",
+      "implemented_scope": "Read local production JSON and inspect its declared structure and embedded screenplay source.",
+      "python_calls": ["json.loads(pathlib.Path(path).read_text(encoding='utf-8-sig'))", "pianchang.production.validate(project)", "pianchang.story_spec.validate_compilation(project)"],
+      "cli": ["python -m pianchang.story_agent validate <project.json>", "python -m pianchang.production validate <legacy-project.json>"],
+      "writes": [],
+      "billing": "none",
+      "limitations": ["No repository-wide asset database or remote project reader.", "The logical name read_project is not a standalone Python function or CLI subcommand."]
+    },
+    {
+      "name": "query_story_state",
+      "availability": "implemented",
+      "implemented_scope": "Query a validated shot's relevant entities, facts, cumulative declared state, sources and prior state-changing event origins.",
+      "python_calls": ["pianchang.story_agent.query_context(project, shot_id)", "pianchang.production.validate(project)"],
+      "cli": ["python -m pianchang.story_agent context <project.json> --shot <shot_id>"],
+      "writes": [],
+      "billing": "none",
+      "limitations": ["Chronological declared state only; no inferred unseen facts, media perception or multiple story timelines.", "Semantic fidelity, visual and audio quality remain unknown."]
+    },
+    {
+      "name": "patch_spec",
+      "availability": "partial",
+      "implemented_scope": "Validate explicitly edited JSON or compile a frozen screenplay into candidates with bounded model repairs that retain the same source and required beats.",
+      "python_calls": ["pianchang.story_agent.StoryRunner.compile(script, output_dir, max_repairs=1)", "pianchang.story_spec.validate_compilation(project, script=None)", "pianchang.production.impact(project, changed_input)"],
+      "cli": ["python -m pianchang.story_agent compile --script <script.json> --output <new-directory>", "python -m pianchang.story_agent validate <project.json> --script <script.json>", "python -m pianchang.production impact <project.json> --changed <entity_id>"],
+      "writes": ["New compilation directory, frozen script, candidates, call records and validation reports"],
+      "billing": "bailian_text_when_compiling_uncached_requests",
+      "limitations": ["No general structured patch endpoint, merge/conflict manager or automatic approval of changed requirements.", "Editing JSON externally requires revalidation and a new contract when its binding changes."]
+    },
+    {
+      "name": "generate_image",
+      "availability": "planned",
+      "implemented_scope": null,
+      "python_calls": [],
+      "cli": [],
+      "writes": [],
+      "billing": "not_implemented",
+      "limitations": ["No image model adapter or approved character/scene reference generation."]
+    },
+    {
+      "name": "edit_image",
+      "availability": "planned",
+      "implemented_scope": null,
+      "python_calls": [],
+      "cli": [],
+      "writes": [],
+      "billing": "not_implemented",
+      "limitations": ["No inpainting, reference editing or image repair workflow."]
+    },
+    {
+      "name": "generate_video",
+      "availability": "implemented",
+      "implemented_scope": "Compile validated text conditions, submit one Bailian text-to-video task, persist it, poll and download its candidate.",
+      "python_calls": ["pianchang.video_agent.compile_shot(project, shot_id)", "pianchang.video_agent.generate_video(config, prompt, duration=None, metadata=None, wait=True, new=False)"],
+      "cli": ["python -m pianchang.video_agent generate --project <project.json> --shot <shot_id> --dry-run", "python -m pianchang.video_agent generate --project <project.json> --shot <shot_id>", "python -m pianchang.video_agent generate --project <project.json> --shot <shot_id> --new"],
+      "writes": ["outputs/videos/<candidate>/job.json", "outputs/videos/<candidate>/video.mp4"],
+      "billing": "bailian_video_generation_except_dry_run_or_existing_task_reuse",
+      "limitations": ["Text-to-video only; reference images and start/end frames are not passed to the model.", "Generation success and media_generated do not establish visual, audio or task acceptance.", "A fixed seed does not lock character identity."]
+    },
+    {
+      "name": "edit_video",
+      "availability": "planned",
+      "implemented_scope": null,
+      "python_calls": [],
+      "cli": [],
+      "writes": [],
+      "billing": "not_implemented",
+      "limitations": ["No general video edit, masked repair, extension or segment replacement adapter.", "Generating a new candidate is not editing an existing video."]
+    },
+    {
+      "name": "generate_audio",
+      "availability": "planned",
+      "implemented_scope": null,
+      "python_calls": [],
+      "cli": [],
+      "writes": [],
+      "billing": "not_implemented",
+      "limitations": ["No standalone voice, dialogue, sound-effects or music generation adapter.", "Audio produced inside a video model and optional audio_url input do not implement this tool."]
+    },
+    {
+      "name": "align_dialogue",
+      "availability": "planned",
+      "implemented_scope": null,
+      "python_calls": [],
+      "cli": [],
+      "writes": [],
+      "billing": "not_implemented",
+      "limitations": ["No transcription, speaker identification, forced alignment or lip-sync verification."]
+    },
+    {
+      "name": "edit_timeline",
+      "availability": "planned",
+      "implemented_scope": null,
+      "python_calls": [],
+      "cli": [],
+      "writes": [],
+      "billing": "not_implemented",
+      "limitations": ["No editable cut timeline, selected candidate tracks or audio/subtitle arrangement.", "chronological shots and continuity_from describe story dependencies, not an executable edit timeline."]
+    },
+    {
+      "name": "render_episode",
+      "availability": "partial",
+      "implemented_scope": "Assemble selected clips in explicit order into a normalized, strictly decoded hard-cut preview, with retained audio or silence for clips without an audio stream.",
+      "python_calls": ["pianchang.episode_export.export_preview(clips, output_dir)"],
+      "cli": ["python -m pianchang.web_server --port 8765 (use the workbench preview export action)"],
+      "writes": ["<output_dir>/preview.mp4", "<output_dir>/export.json"],
+      "billing": "none",
+      "limitations": ["Always PREVIEW_ONLY and accepted=false; technical decoding does not accept story, identity or continuity.", "No editable multi-track timeline, independent dubbing, music, subtitles or transitions.", "The Web workbench exports all ordered project shots as one preview; it does not automatically split a multi-episode project into episode deliveries."]
+    },
+    {
+      "name": "inspect_media",
+      "availability": "implemented",
+      "implemented_scope": "Probe local video metadata, strictly decode the full file and extract JPEG samples tied to decoded frame indices and actual source timestamps.",
+      "python_calls": ["pianchang.media_tools.inspect_media(media_path, output_dir, interval_s=1.0, max_frames=24)"],
+      "cli": ["python -m pianchang.acceptance inspect <video.mp4> --output <inspection-directory> --interval 1 --max-frames 9"],
+      "writes": ["<inspection-directory>/inspection.json", "<inspection-directory>/F000.jpg and subsequent sampled JPEGs"],
+      "billing": "none",
+      "limitations": ["Requires working FFmpeg and ffprobe binaries.", "Full decoding is not full content observation; sparse samples cannot prove action continuity or dialogue correctness.", "An audio stream count is not audio-content analysis."]
+    },
+    {
+      "name": "analyze_media",
+      "availability": "partial",
+      "implemented_scope": "Ask Qwen VL for evidence-cited sampled static observations, limited to contract sampled_visual requirements.",
+      "python_calls": ["pianchang.bailian_observer.BailianObserver(config).complete_observations(frames, criteria)", "pianchang.acceptance.observe(inspection, contract, config=None, client=None)"],
+      "cli": ["python -m pianchang.acceptance observe --contract <contract.json> --inspection <inspection.json> --output <observations.json>"],
+      "writes": ["<observations.json> with contract, inspection and media hashes"],
+      "billing": "bailian_vision",
+      "limitations": ["Input is timestamped still images, not a complete video viewing or audio analysis.", "At most 24 images, 10 MiB per image and 16 MiB for the whole request.", "No calibrated reference identity, camera geometry, continuous action or neighboring-candidate review.", "Model PASS/FAIL/UNKNOWN labels remain observations; caller evidence checks determine whether a criterion can use them."]
+    },
+    {
+      "name": "run_checks",
+      "availability": "partial",
+      "implemented_scope": "Freeze a version-bound shot contract, enforce its fixed policy, bind the generation job to the target shot and actual candidate, verify evidence and evaluate technical or sampled-static criteria; preserve UNKNOWN for unsupported capabilities.",
+      "python_calls": ["pianchang.acceptance.create_contract(project, shot_id, width=720, height=1280)", "pianchang.acceptance.regression_plan(project, shot_id)", "pianchang.acceptance.run_checks(project, contract, inspection, observations=None, job=None)"],
+      "cli": ["python -m pianchang.acceptance contract --project <project.json> --shot <shot_id> --output <contract.json>", "python -m pianchang.acceptance regression --project <project.json> --shot <shot_id>", "python -m pianchang.acceptance check --project <project.json> --contract <contract.json> --inspection <inspection.json> --observations <observations.json> --job <job.json> --output <report.json>"],
+      "writes": ["<contract.json>", "<report.json>"],
+      "billing": "none",
+      "limitations": ["Required FAIL or UNKNOWN blocks task_complete.", "Missing generation job makes candidate_binding UNKNOWN; mismatched project, shot, input or downloaded candidate makes it FAIL.", "Deleting or weakening fixed required criteria, evidence capabilities, scope or regression dependencies fails contract policy validation.", "Missing identity references, full action evidence, scene geometry, audio and adjacent-candidate review remain UNKNOWN.", "A regression plan gives review scope but does not run the planned checks.", "Acceptance scope is the frozen shot contract, not the whole episode or creative quality."]
+    },
+    {
+      "name": "manage_jobs",
+      "availability": "partial",
+      "implemented_scope": "Submit, query and resume persisted video tasks, with local download recovery and protection against ambiguous duplicate submissions. The Web service adds a serial durable queue and request idempotency; interrupted work is not automatically replayed.",
+      "python_calls": ["pianchang.video_agent.VideoRunner(config).submit(payload, metadata=None, new=False)", "pianchang.video_agent.VideoRunner(config).resume(manifest_path, wait=True, download=True)", "pianchang.bailian_video.BailianVideoClient(config).get_task(task_id)"],
+      "cli": ["python -m pianchang.video_agent generate --project <project.json> --shot <shot_id> --no-wait", "python -m pianchang.video_agent status <job.json>", "python -m pianchang.video_agent resume <job.json>"],
+      "writes": ["Existing or new video job manifest", "Downloaded video candidate"],
+      "billing": "new_video_submissions_are_billable",
+      "limitations": ["No cloud cancellation, distributed queue or unified cost budget manager.", "Interrupting local waiting does not cancel the cloud task.", "A submission without a returned task_id cannot be automatically retried safely."]
+    },
+    {
+      "name": "manage_versions",
+      "availability": "partial",
+      "implemented_scope": "Keep frozen script/input hashes, model candidates, inspection hashes and cached task records; identify declared downstream review scope. The Web workbench can select an existing valid candidate and invalidates stale preview/acceptance bindings.",
+      "python_calls": ["pianchang.story_spec.digest_json(value)", "pianchang.story_spec.validate_compilation(project, script=None)", "pianchang.production.impact(project, changed_input)", "pianchang.acceptance.regression_plan(project, shot_id)"],
+      "cli": ["python -m pianchang.story_agent validate <project.json> --script <current-script.json>", "python -m pianchang.production impact <project.json> --changed <entity_id>", "python -m pianchang.video_agent generate --project <project.json> --shot <shot_id> --new"],
+      "writes": ["New candidate directories and their hashes when explicitly generated"],
+      "billing": "new_candidates_may_trigger_model_calls",
+      "limitations": ["No branch/merge system or unified asset version database.", "Changing input hashes invalidates evidence reuse; it does not by itself decide which assets require regeneration.", "Embedded source snapshots cannot detect external script changes unless checked against the current external script."]
+    }
+  ]
+}

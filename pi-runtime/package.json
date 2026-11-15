@@ -1,0 +1,7 @@
+{
+  "name": "drama-pi-runtime",
+  "private": true,
+  "type": "module",
+  "scripts": {"check": "node --check src/main.mjs", "test": "cd .. && python -m unittest tests.test_pi_runtime"},
+  "dependencies": {"@earendil-works/pi-coding-agent": "1.5.2"}
+}

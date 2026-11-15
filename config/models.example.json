@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "extends": "bailian",
+  "connections": {
+    "google-main": {
+      "provider": "google",
+      "account": "studio-google",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "api_key_env": "GEMINI_API_KEY"
+    },
+    "openai-art": {
+      "provider": "openai",
+      "account": "studio-openai",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY"
+    },
+    "ark-production": {
+      "provider": "volcengine-ark",
+      "account": "studio-ark",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "api_key_env": "ARK_VIDEO_API_KEY"
+    }
+  },
+  "models": {
+    "gemini-writer": {
+      "connection": "google-main",
+      "adapter": "litellm",
+      "sdk_provider": "openai",
+      "model_id": "your-gemini-model-id"
+    },
+    "gpt-reference-image": {
+      "connection": "openai-art",
+      "adapter": "litellm",
+      "sdk_provider": "openai",
+      "model_id": "your-image-model-id"
+    },
+    "seedance-reference-video": {
+      "connection": "ark-production",
+      "adapter": "litellm",
+      "sdk_provider": "volcengine",
+      "model_id": "your-ark-endpoint-id"
+    }
+  },
+  "routes": {
+    "script.decision": "gemini-writer",
+    "video.decision": "bailian.text",
+    "reference.image": "gpt-reference-image",
+    "video.text_to_video": "bailian.video",
+    "video.reference_to_video": "seedance-reference-video"
+  }
+}

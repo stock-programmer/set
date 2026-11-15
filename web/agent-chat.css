@@ -1,0 +1,15 @@
+.agent-chat { margin-top:24px; }
+.agent-chat-tabs, .agent-chat-controls { display:flex; gap:10px; flex-wrap:wrap; }
+.agent-chat-tabs { margin:16px 0; }
+.agent-chat-messages { display:grid; gap:12px; max-height:520px; overflow:auto; margin-bottom:18px; }
+.agent-chat-message {
+  padding:14px 16px;
+  background:var(--panel-deep);
+  border:1px solid var(--line);
+  border-radius:12px;
+}
+.agent-chat-message.user { margin-left:8%; background:var(--accent-soft); border-color:var(--sea); }
+.agent-chat-message.agent { border-style:dashed; }
+.agent-chat-message p { white-space:pre-wrap; overflow-wrap:anywhere; margin:8px 0; }
+.agent-chat-form textarea { width:100%; box-sizing:border-box; margin-bottom:12px; }
+.agent-chat-controls { align-items:center; }

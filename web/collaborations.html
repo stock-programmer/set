@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#FFF5DF">
+  <title>Agent 协作记录 · 片场</title>
+  <link rel="icon" type="image/svg+xml" href="/pianchang.svg">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/collaborations.js" defer></script>
+  <link rel="stylesheet" href="/collaborations.css">
+</head>
+<body>
+  <a class="skip-link" href="#collab-main">跳到协作详情</a>
+  <div class="collab-shell">
+    <header class="collab-top">
+      <a href="/">← 片场工作台</a>
+      <strong>Agent 协作记录</strong>
+      <span class="collab-page-status" id="page-status" role="status" aria-live="polite"></span>
+      <button type="button" class="button button-small" id="reload">刷新记录</button>
+    </header>
+    <div class="collab-layout">
+      <nav class="collab-nav" aria-label="协作任务"><h2>协作任务</h2><div id="run-list"></div></nav>
+      <main class="collab-main" id="collab-main" tabindex="-1" aria-busy="true">
+        <h1>正在读取协作记录</h1>
+      </main>
+    </div>
+  </div>
+</body>
+</html>

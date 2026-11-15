@@ -1,0 +1,82 @@
+{
+  "schema_version": "0.1",
+  "title": "最后一把钥匙：三镜头连续性实验",
+  "script_version": 1,
+  "timeline_mode": "chronological",
+  "entities": {
+    "char:lin": {
+      "kind": "character", "version": 1,
+      "canonical": {"name": "林岚", "identity": "成年女性，短黑发，左眉有浅疤", "voice": "待选定声音参考"},
+      "references": []
+    },
+    "char:chen": {
+      "kind": "character", "version": 1,
+      "canonical": {"name": "陈默", "identity": "成年男性，卷发，戴细框眼镜", "voice": "待选定声音参考"},
+      "references": []
+    },
+    "scene:office": {
+      "kind": "scene", "version": 1,
+      "canonical": {"name": "旧办公室", "coordinate_frame": "房间世界坐标，不是画面左右", "layout": "西墙门、北墙窗、中央木桌"},
+      "references": []
+    },
+    "prop:key": {
+      "kind": "prop", "version": 1,
+      "canonical": {"name": "铜钥匙", "appearance": "一把铜钥匙，红色方形钥匙牌"},
+      "references": []
+    },
+    "costume:coat": {
+      "kind": "costume", "version": 1,
+      "canonical": {"name": "林岚米色风衣", "appearance": "米色双排扣风衣"},
+      "references": []
+    }
+  },
+  "facts": {
+    "char:lin.costume": {"initial": "costume:coat", "mutable": true, "allowed": ["costume:coat"]},
+    "char:lin.location": {"initial": "scene:office", "mutable": true, "allowed": ["scene:office"]},
+    "char:chen.location": {"initial": "scene:office", "mutable": true, "allowed": ["scene:office"]},
+    "char:chen.knows_key_origin": {"initial": false, "mutable": true, "allowed": [false, true]},
+    "prop:key.holder": {"initial": "char:lin", "mutable": true, "allowed": ["char:lin", "char:chen", "scene:office.table"]},
+    "scene:office.door_wall": {"initial": "west", "mutable": false, "allowed": ["west", "east"]},
+    "scene:office.time_of_day": {"initial": "night", "mutable": true, "allowed": ["night", "day"]}
+  },
+  "events": [
+    {
+      "id": "event:handover",
+      "reason": "林岚把铜钥匙交给陈默。陈默拿到钥匙，但还不知道来源。",
+      "requires": {"prop:key.holder": "char:lin"},
+      "changes": {"prop:key.holder": "char:chen"}
+    }
+  ],
+  "shots": [
+    {
+      "id": "S001", "duration_s": 6, "scene_id": "scene:office",
+      "description": "中景。夜，旧办公室。林岚拿出铜钥匙，陈默看向她的手。",
+      "entity_ids": ["char:lin", "char:chen", "prop:key", "costume:coat"],
+      "input_versions": {"script": 1, "char:lin": 1, "char:chen": 1, "scene:office": 1, "prop:key": 1, "costume:coat": 1},
+      "continuity_from": [],
+      "requires": {"prop:key.holder": "char:lin", "scene:office.time_of_day": "night"},
+      "event_ids": [],
+      "expected_after": {"prop:key.holder": "char:lin", "char:chen.knows_key_origin": false}
+    },
+    {
+      "id": "S002", "duration_s": 8, "scene_id": "scene:office",
+      "description": "手部近景。林岚把铜钥匙放进陈默手中，陈默合拢手指。",
+      "entity_ids": ["char:lin", "char:chen", "prop:key", "costume:coat"],
+      "input_versions": {"script": 1, "char:lin": 1, "char:chen": 1, "scene:office": 1, "prop:key": 1, "costume:coat": 1},
+      "continuity_from": ["S001"],
+      "requires": {"prop:key.holder": "char:lin", "char:lin.costume": "costume:coat"},
+      "event_ids": ["event:handover"],
+      "expected_after": {"prop:key.holder": "char:chen"}
+    },
+    {
+      "id": "S003", "duration_s": 8, "scene_id": "scene:office",
+      "description": "陈默近景。他举起刚接到的铜钥匙，仍不知道它的来源。反打不能改变房间实际布局。",
+      "entity_ids": ["char:chen", "prop:key"],
+      "input_versions": {"script": 1, "char:chen": 1, "scene:office": 1, "prop:key": 1},
+      "continuity_from": ["S002"],
+      "requires": {"prop:key.holder": "char:chen", "char:chen.knows_key_origin": false, "scene:office.door_wall": "west"},
+      "event_ids": [],
+      "expected_after": {"prop:key.holder": "char:chen"}
+    }
+  ]
+}
