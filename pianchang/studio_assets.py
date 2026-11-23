@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import copy
 import hashlib
 import json
 import re
@@ -10,6 +11,7 @@ import sqlite3
 import tempfile
 from contextlib import closing
 from dataclasses import replace
+from http.client import HTTPException
 from pathlib import Path
 from urllib import error, request
 from urllib.parse import urlencode, urlsplit
@@ -20,7 +22,7 @@ from pianchang.bailian_video import _NoRedirect, _trace_http_request, _trace_htt
 from pianchang.collab_store import CollabStore
 from pianchang.reference_assets import SUBJECT_KINDS, _mime, asset_pin, bind_project, import_reference
 from pianchang.story_spec import digest_json
-from trace_system import current_context, event, register_secret, traced
+from trace_system import TraceError, current_context, event, register_secret, traced
 
 
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024
@@ -64,10 +66,107 @@ def _source_scope(source, pid):
     return run_id, None
 
 
+def _shot_layout(project):
+    """Binding media can add reference_story_id and shot pins, but cannot change the cut."""
+    return {**{k:v for k,v in project.items() if k not in {"reference_story_id","shots"}},
+            "shots":[{k:v for k,v in shot.items() if k!="required_refs"} for shot in project["shots"]]}
+
+
+def _rebind_shared_pins(project, previous, previous_source, story):
+    """Carry identical pins across a recut only for fully covered beats and unchanged entities."""
+    result=copy.deepcopy(project)
+    beat_ids={beat["id"] for episode in project["script_source"]["script"]["episodes"]
+              for scene in episode["scenes"] for beat in scene["beats"]}
+    def covered(shot):
+        return {r["source_id"] for r in shot.get("source_refs",[]) if r["source_id"] in beat_ids}
+    prior=[(covered(s),s.get("required_refs",[])) for s in previous["shots"]]
+    declared=[(covered(s),s.get("required_refs",[])) for s in previous_source["shots"]]
+    for shot in result["shots"]:
+        beats=covered(shot)
+        contributing=[(ids,pins) for ids,pins in prior if ids & beats]
+        if not contributing or not beats.issubset(set().union(*(ids for ids,_ in contributing))):
+            continue
+        subjects={shot["scene_id"],*shot["entity_ids"]}
+        explicit={(p["subject_id"],p["purpose"]) for p in shot.get("required_refs",[])}
+        # Removing an authored source pin in the new cut is also an explicit edit.
+        explicit.update((p["subject_id"],p["purpose"]) for ids,pins in declared if ids & beats for p in pins)
+        for pin in contributing[0][1]:
+            subject=pin["subject_id"]
+            if (subject in subjects and (subject,pin["purpose"]) not in explicit
+                    and previous["entities"].get(subject)==project["entities"].get(subject)
+                    and all(pin in pins for _,pins in contributing)):
+                shot.setdefault("required_refs",[]).append(pin)
+                result["reference_story_id"]=story
+    return result
+
+
+@traced("studio.assets.sync_published_spec",kind="tool",capture_inputs=False)
+def sync_published_spec(service, pid, path):
+    """Append a binding revision when a new source-project revises the same frozen script."""
+    run_id,metadata=_source_scope(path,pid)
+    source_ref=(metadata or {}).get("source_ref")
+    if not source_ref or source_ref.get("revision_id")=="r1":
+        return
+    story="story-"+run_id
+    db_path=_db_path(service)
+    if not db_path.is_file():
+        raise FileNotFoundError("工程映射所指向的资产库不存在。")
+    store=CollabStore(db_path)
+    source=store.get_asset(story+"/source-project",source_ref["revision_id"])
+    _check("分镜发布版本",source_ref,_identity(source))
+    project=source["content"]
+    _check("分镜工程文件",source_ref["sha256"],digest_json(json.loads(path.read_text(encoding="utf-8-sig"))))
+    spec_id=story+"/studio-spec/"+_script_hash(project)
+    revisions=store.revisions(spec_id)
+    if not revisions:
+        return
+    head=revisions[-1]
+    if head["created_at"]>=source["created_at"] and _shot_layout(head["content"])==_shot_layout(project):
+        return
+    # A revised cut and a media binding use the same immutable revision stream.
+    # The transaction rechecks both heads after verifying the media outside the writer lock.
+    head_layout=_shot_layout(head["content"])
+    parent=source["parent_revision"]
+    updated=project
+    while parent is not None:
+        ancestor=store.get_asset(source["asset_id"],parent)
+        if head_layout==_shot_layout(ancestor["content"]):
+            updated=_rebind_shared_pins(project,head["content"],ancestor["content"],story)
+            break
+        parent=ancestor["parent_revision"]
+    script_ref=metadata["script_ref"]
+    script=store.get_asset(story+"/script",script_ref["revision_id"])
+    _check("同故事的剧本发布回执",script_ref,_identity(script))
+    _check("分镜冻结剧本", script_ref["sha256"], _script_hash(project))
+    from pianchang.collaboration_workflow import dep
+    dependencies=[dep(source_ref,"source_project"),dep(script_ref,"target_script")]
+    unique={}
+    for shot in updated["shots"]:
+        for pin in shot.get("required_refs",[]):
+            unique[pin["asset_id"],pin["revision_id"]]=pin
+            dependencies.append(dep(pin,"required_reference",shot["id"]))
+    from pianchang.reference_assets import resolve_references
+    for pin in unique.values():
+        resolve_references(store,[pin],story_id=story)
+    from pianchang.story_spec import validate_compilation
+    report=validate_compilation(updated,project["script_source"]["script"])
+    problems=[i for i in report["issues"] if i["code"]!="MISSING_REFERENCE" and i.get("severity","error")=="error"]
+    _check("新版制作规格结构和原文覆盖",[],problems)
+    with store.transaction():
+        _check("当前已发布分镜",source_ref,_identity(store.get_asset(source["asset_id"])))
+        current=store.get_asset(spec_id)
+        if current["revision_id"]!=head["revision_id"] and current["sha256"]==digest_json(updated):
+            return
+        _check("待同步的制作规格",_identity(head),_identity(current))
+        store.publish_asset(spec_id,updated,kind="production_spec",producer="production",
+                            story_id=story,parent_revision=head["revision_id"],dependencies=dependencies)
+
+
 def _read_view(service, pid, revision=None, *, include_references=True):
     """Match a source by exact content. Never join unrelated scripts on a shared title."""
     source, project = service._project(pid)
     source_hash = digest_json(project)
+    source_project = project
     run_id, metadata = _source_scope(source, pid)
     story = "story-" + run_id
     db_path = _db_path(service)
@@ -99,6 +198,14 @@ def _read_view(service, pid, revision=None, *, include_references=True):
                              "ORDER BY seq DESC LIMIT 1", (story, story + "/production")).fetchone()
             if row:
                 production = CollabStore._asset(db, row)
+            source_ref=(metadata or {}).get("source_ref") or {}
+            revised_source=source_ref.get("revision_id") not in (None,"r1")
+            if revised_source:
+                published=db.execute("SELECT sha256,created_at FROM assets WHERE story_id=? AND asset_id=? AND revision_id=? AND kind='input_project'",
+                                     (story,source_ref["asset_id"],source_ref["revision_id"])).fetchone()
+                _check("当前分镜来源指纹",source_hash,published["sha256"] if published else None)
+                _check("发布回执的分镜指纹",source_hash,source_ref["sha256"])
+            if production and not revised_source:
                 project = production["content"]["project"]
                 script_ref = production["content"]["script_ref"]
             else:
@@ -118,7 +225,13 @@ def _read_view(service, pid, revision=None, *, include_references=True):
             row = db.execute(sql + " ORDER BY seq DESC LIMIT 1", query).fetchone()
             if row:
                 spec = CollabStore._asset(db, row)
-                project = spec["content"]
+                if revision is None and revised_source and (spec["created_at"]<published["created_at"]
+                        or _shot_layout(spec["content"])!=_shot_layout(source_project)):
+                    # A reader racing source publication sees the new unbound cut.
+                    # Only a writer may create a binding revision.
+                    spec=None
+                else:
+                    project = spec["content"]
             latest = db.execute("SELECT * FROM assets WHERE kind='script' AND story_id=? AND asset_id=? "
                                 "ORDER BY seq DESC LIMIT 1", (story, story + "/script")).fetchone()
             if latest:
@@ -159,6 +272,10 @@ def studio_project_for_video(service, pid, spec_revision=None, *, include_delive
         # _read_view verified the stored content hash and selected this exact
         # production revision in the same read-only transaction as the spec.
         view["published_delivery"] = production["content"] if production else None
+        view["published_spec_dependencies"] = [
+            {key: dep[key] for key in ("asset_id", "revision_id")}
+            for dep in (production or {}).get("dependencies", []) if dep["role"] == "production_input"
+        ]
     return view
 
 
@@ -391,29 +508,68 @@ def _download_image(url, timeout):
 
 
 def _sdk_reference_image(route, prompt, timeout):
+    from pianchang.asset_diagnostics import IMAGE_ACCESS_ERRORS, model_not_found_id
     from pianchang.sdk_transport import call_sdk
 
-    response = call_sdk(route, "image_generation", timeout=timeout, prompt=prompt, size="1024x1024", n=1)
+    # Request one image using the API's single-image default. The response count
+    # is checked below, including on compatible endpoints that don't define n.
+    options = {"size": route.image_size or "1024x1024"}
+    if route.image_response_format is not None:
+        options["response_format"] = route.image_response_format
+    try:
+        response = call_sdk(route, "image_generation", timeout=timeout, prompt=prompt, **options)
+    except TraceError:
+        raise
+    except Exception as exc:
+        receipt = getattr(exc, "wire_receipt", {}) or {}
+        code = receipt.get("provider_code") or getattr(exc, "code", None)
+        if not code and model_not_found_id(str(exc)) == route.model_id:
+            code = "InvalidEndpointOrModel.NotFound"
+        if isinstance(code, str) and code in IMAGE_ACCESS_ERRORS and receipt.get("http_status") == IMAGE_ACCESS_ERRORS[code]:
+            exc.rejected_image_model = route.model_id
+            exc.rejected_image_code = code
+        raise
+    receipt = response.get("_wire_receipt") or {}
+    status = receipt.get("http_status")
+    request_id = response.get("_provider_request_id") or receipt.get("provider_request_id")
+    received = f"供应商已返回 HTTP {status}" if isinstance(status, int) else "供应商已返回生图响应"
+    if isinstance(request_id, str) and re.fullmatch(r"[a-zA-Z0-9_.:-]{1,256}", request_id):
+        received += f"（请求 ID {request_id}）"
+
+    def image_error(reason):
+        return ValueError(f"{received}。{reason} 请先核对该次回执，避免重复付费生成。")
+
     items = response.get("data")
     if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
-        raise ValueError("供应商未返回请求的一张参考图，请查看任务 Trace。")
+        raise image_error("回执未包含请求的一张参考图。")
     encoded = items[0].get("b64_json")
+    if encoded is None and route.image_response_format == "b64_json":
+        raise image_error("回执缺少请求的 b64_json 原图，未保存新版本。")
     if encoded is None and items[0].get("url"):
-        data = _download_image(items[0]["url"], timeout)
+        try:
+            data = _download_image(items[0]["url"], timeout)
+        except (OSError, HTTPException, ValueError):
+            raise image_error("已生成参考图，但从结果地址下载原图失败，未保存新版本。") from None
     else:
         if not isinstance(encoded, str) or len(encoded) > 4 * ((MAX_UPLOAD_BYTES + 2) // 3):
-            raise ValueError("参考图编码无效或文件超过 8 MiB。")
+            raise image_error("参考图编码无效或文件超过 8 MiB。")
         try:
             data = base64.b64decode(encoded, validate=True)
         except (ValueError, binascii.Error) as exc:
-            raise ValueError("供应商返回的参考图不是有效的 Base64。") from exc
-        if not 0 < len(data) <= MAX_UPLOAD_BYTES or not _mime(data).startswith("image/"):
-            raise ValueError("参考图为空、格式无效或超过 8 MiB。")
+            raise image_error("供应商返回的参考图不是有效的 Base64。") from exc
+        if not 0 < len(data) <= MAX_UPLOAD_BYTES:
+            raise image_error("参考图为空或超过 8 MiB。")
+        try:
+            is_image = _mime(data).startswith("image/")
+        except ValueError:
+            is_image = False
+        if not is_image:
+            raise image_error("返回的参考图格式无效。")
     return data, response
 
 
 @traced("studio.reference.generate", kind="tool")
-def generate_studio_reference(service, pid, body, *, brief=None, repair=""):
+def generate_studio_reference(service, pid, body, *, brief=None, repair="", voice_replay=None, image_route_sha256=None):
     validated = validate_studio_reference_body(service, pid, body)
     view, assets, _ = _read_view(service, pid)
     target = _target(view, assets, body)
@@ -426,12 +582,15 @@ def generate_studio_reference(service, pid, body, *, brief=None, repair=""):
         if brief is None:
             raise ValueError("声音制作需要包含试听要求的资产委托。")
         from pianchang.asset_voice import synthesize_voice
-        data, mime, origin = synthesize_voice(service, brief, repair)
+        options = {"replay": voice_replay} if voice_replay is not None else {}
+        data, mime, origin = synthesize_voice(service, brief, repair, **options)
         result = _import_bytes(view, target, data, mime, {**origin, "method":"generated", "brief":brief, "review_required":True})
         return {**result, "model": origin.get("model"), "request_id": origin.get("request_id")}
     routes = getattr(service, "model_routes", None)
     route = routes.resolve("reference.image") if routes is not None else None
     model = route.model_id if route else IMAGE_MODEL
+    if image_route_sha256:
+        _check("已核实的参考图恢复路由", image_route_sha256, digest_json(route.snapshot()) if route else None)
     prompt = compose_reference_prompt(service, target, brief, repair, qwen_image=model == IMAGE_MODEL)
     if route and route.adapter == "litellm":
         data, response = _sdk_reference_image(route, prompt, max(120, service.video_config.request_timeout))
@@ -455,6 +614,8 @@ def generate_studio_reference(service, pid, body, *, brief=None, repair=""):
         if route.adapter == "litellm" and response.get("_wire_receipt"):
             wire = response["_wire_receipt"]
             origin["wire_receipt"] = {k: wire[k] for k in ("trace_context", "wire_body_sha256") if k in wire}
+            if "provider_created_at" in wire:
+                origin["provider_created_at"] = wire["provider_created_at"]
     if response.get("model"):
         origin["response_model"] = response["model"]
     if brief is not None:

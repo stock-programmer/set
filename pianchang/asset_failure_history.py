@@ -1,9 +1,40 @@
 """Project friendly asset diagnostics from the events of a single finished order."""
-from pianchang.asset_diagnostics import asset_diagnostic
+from pianchang.asset_diagnostics import asset_diagnostic, asset_failure_summary
 from trace_system import traced
 
 
 _NAMES = ("studio.assets.unit.transition", "asset.reference.review", "asset.reference.loop", "collab.assets.publish")
+
+
+def legacy_model_error(issue):
+    return (isinstance(issue, dict) and issue.get("stage") == "unknown" and
+            "404 - The model or endpoint " in (issue.get("reason") or ""))
+
+
+def project_recorded_failures(service, job, recorded):
+    # Old summaries clipped the provider error mid-sentence. Use the original
+    # order's full error, even when a later order has replaced its work item.
+    with service.lock:
+        work = service.state.get("asset_work", {}).get(job["project_id"], {}).get("items", {})
+        rows = {(row["subject_id"], row["purpose"]): dict(row) for row in work.values()
+                if row.get("job_id") == job["id"] and row.get("trace_id") == job["trace_id"]}
+    history = None
+    projected = []
+    for issue in recorded["items"]:
+        if legacy_model_error(issue) and issue.get("trace_id") == job["trace_id"]:
+            key = (issue.get("subject_id"), issue.get("purpose"))
+            row = rows.get(key)
+            if row and row.get("status") == "needs_attention" and row.get("candidate") == issue.get("candidate"):
+                diagnosis = asset_diagnostic(row)
+            else:
+                if history is None:
+                    history = {(x["subject_id"], x["purpose"]): x
+                               for x in read_asset_job_history(service, job)["items"]}
+                diagnosis = history.get(key)
+            if diagnosis and diagnosis.get("code") == "image_model_access":
+                issue = {**issue, **{k: diagnosis[k] for k in ("code", "model_id", "reason", "action", "stage", "verdict")}}
+        projected.append(issue)
+    return {**recorded, "summary": asset_failure_summary(recorded.get("summary", ""), projected), "items": projected}
 
 
 def _order_events(tracer, trace_id):
@@ -60,5 +91,6 @@ def read_asset_job_history(service, job):
                                  trace_id=trace_id, span_id=span_id)
         if issue:
             issues.append(issue)
-    return {"project_id": job["project_id"], "summary": (job.get("result") or {}).get("summary") or job.get("error"),
+    summary = (job.get("result") or {}).get("summary") or job.get("error") or ""
+    return {"project_id": job["project_id"], "summary": asset_failure_summary(summary, issues),
             "items": issues}

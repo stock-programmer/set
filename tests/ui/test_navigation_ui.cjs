@@ -118,7 +118,7 @@ assert.ok(!walk(get('stage')).some(e=>e.dataset.productionTool==='agent'||e.id==
   await new Promise(resolve=>setImmediate(resolve));
   assert.equal(monitor().dataset.readState,'ready');
   assert.equal(overview().dataset.projectOpening,'B','Progress can paint while the complete workspace is still pending');
-  assert.ok(text(monitor()).includes('已生成 1 / 2'));passed++;
+  assert.ok(text(monitor()).includes('已有镜头素材 1 / 2'));passed++;
   reads[1].reject(Error('offline test failure'));await new Promise(resolve=>setImmediate(resolve));
   assert.ok(text(overview()).includes('画面 B'));assert.ok(text(overview()).includes('offline test failure'));
   delete videoJob.recorded_progress;
@@ -153,13 +153,13 @@ assert.ok(!walk(get('stage')).some(e=>e.dataset.productionTool==='agent'||e.id==
     job_status:'running',phase:'generating',preview_gate:{ready:false},shots:[{shot_id:'S2',status:'generating'}]})});
   await new Promise(resolve=>setImmediate(resolve));assert.equal(monitor().dataset.readState,'ready');
   const jobCard=()=>walk(get('job-list')).find(e=>e.dataset?.jobId===videoJob.id);
-  assert.ok(text(jobCard()).includes('已生成 0 / 1'));assert.ok(!text(jobCard()).includes('准备工具与输入'));
+  assert.ok(text(jobCard()).includes('已有镜头素材 0 / 1'));assert.ok(!text(jobCard()).includes('准备工具与输入'));
   const failedRead=run('studioLocal("B").monitor.refresh(true)');
   resolveProgress({status:503,ok:false,json:async()=>({error:'offline failure'})});await failedRead;
-  assert.ok(text(jobCard()).includes('上次读取'));assert.ok(text(jobCard()).includes('已生成 0 / 1'));
+  assert.ok(text(jobCard()).includes('上次读取'));assert.ok(text(jobCard()).includes('已有镜头素材 0 / 1'));
   context.otherJobs=[{...videoJob,status:'failed',error:'实际失败原因',updated_at:'2026-11-20T12:00:00Z'}];
   run('state.jobs=otherJobs;state.jobsReady=true;renderJobs()');
-  assert.ok(text(jobCard()).includes('实际失败原因'));assert.ok(!text(jobCard()).includes('已生成 0 / 1'));
+  assert.ok(text(jobCard()).includes('实际失败原因'));assert.ok(!text(jobCard()).includes('已有镜头素材 0 / 1'));
   run('state.projectId="A";renderJobs()');assert.equal(jobCard(),undefined);
   run('state.projectId="B"');passed++;
   reads.at(-1).resolve(snapshot('B'));await deep;

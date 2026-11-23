@@ -54,8 +54,9 @@ class PiLoop:
                  cancelled=None, pause_check=None, stop_check=None, prepare=None, maintain=None,
                  recover=None, session_file=None, on_ready=None, inbox=None, on_event=None,
                  execution_lock=None, system_prompt="", session_dir=None,initial_message=None,external_model_usage=None,
-                 model_route=None, credential_env_names=()):
+                 model_route=None, credential_env_names=(), creative_input_check=None):
         self.model_route = model_route
+        self.creative_input_check = creative_input_check
         self.credential_env_names = frozenset(name.upper() for name in credential_env_names)
         self.client, self.tools, self.directory = client, {t.name: t for t in tools}, Path(directory)
         self.snapshot, self.finish_check, self.progress = snapshot, finish_check, progress
@@ -136,7 +137,10 @@ class PiLoop:
     def before_model(self, incoming, purpose="decision"):
         with self.lock:
             if purpose not in {"decision","compaction"}:raise ValueError("Invalid Pi model purpose")
-            if (self.outcome and purpose!="compaction") or self.cancelled and self.cancelled(): raise ValueError("Pi run stopped")
+            if self.outcome and purpose != "compaction":
+                raise ValueError(self.outcome[1])
+            if self.cancelled and self.cancelled():
+                raise ValueError("Pi run stopped")
             event("pi.model.purpose",{"purpose":purpose,"business_outcome":self.outcome[0] if self.outcome else None},kind="state")
             external=self.external_model_usage() if self.external_model_usage else 0
             used=self.record["steps"]+external
@@ -145,18 +149,26 @@ class PiLoop:
                 "actual":{"calls":used,"external_calls":external,"limit":self.record["limits"]["max_steps"]},
                 "status":"PASS" if used<self.record["limits"]["max_steps"] else "FAIL"},kind="validation")
             if used >= self.record["limits"]["max_steps"]:
+                self.record["model_limit_reached"] = {"used":used, "limit":self.record["limits"]["max_steps"]}
                 raise ValueError("Pi 模型调用额度已用完，执行未完成")
             self.record["steps"] += 1; self.save()
             if self.progress: self.progress({"phase":"model", "step":self.record["steps"], "summary":"Pi 正在根据会话与实际工具结果决定下一步"})
 
     def state(self):
         value = self.snapshot() if callable(self.snapshot) else self.snapshot
-        if self.maintain: value = {"state":value, "autonomous_work_queue":self.maintain(self.record)}
+        if self.maintain:
+            queue = self.maintain(self.record)
+            if queue.get("terminal_summary") and not self.outcome:
+                self.outcome = ("needs_input", queue["terminal_summary"], {"complete": False, "reason": "acceptance_retake_limit"})
+            value = {"state":value, "autonomous_work_queue":queue}
         return value
 
     @traced("pi.loop.execute_tool", kind="tool", capture_inputs=False)
     def execute(self, name, args, call_id):
+        if self.outcome or self.cancelled and self.cancelled(): raise ValueError("已停止后续工具执行")
         if name == "finish_task":
+            if "creative_input" in args and (self.creative_input_check is None or args.get("outcome") != "needs_input"):
+                raise ValueError("本轮角色或权限不接受创作资料问题。")
             if args.get("outcome")=="responded":
                 stopping=self.stop_check(self.record) if self.stop_check else {"allowed":True}
                 if not stopping.get("allowed"):
@@ -171,10 +183,14 @@ class PiLoop:
                 return {"task_complete": True, "completion_check": check}
             stopping = self.stop_check(self.record) if self.stop_check else {"allowed":True}
             if args.get("outcome") == "needs_input" and stopping.get("allowed"):
+                if "creative_input" in args:
+                    if self.record.get("pending_tool"):
+                        raise ValueError("先核实尚未确认的操作。")
+                    question = self.creative_input_check(args["creative_input"])
+                    check = {**check, "reason": "script_creative_input", "creative_input": question}
                 self.outcome = ("needs_input", args["summary"], check)
                 return {"task_complete":False,"blockers":stopping,"completion_check":check}
             return {"task_complete":False,"finish_rejected":True,"completion_check":check,"work_remaining":stopping}
-        if self.outcome or self.cancelled and self.cancelled(): raise ValueError("已停止后续工具执行")
         tool = self.tools[name]
         try:_validate(args, tool.parameters)
         except ValueError:
@@ -190,10 +206,11 @@ class PiLoop:
                 raise ValueError("视频生成额度已用完；未提交")
             plan = self.record.get("shooting_plan")
             if plan:
+                from pianchang.video_repair import retake_limit
                 policy = plan.get("acceptance_loop") or {}
                 sid = args.get("shot_id"); is_repair = name == "regenerate_shot" and bool(policy)
                 count = self.record["repair_reservations"].get(sid, 0)
-                allowed = (sid in policy.get("shot_ids", []) and count < policy.get("max_repairs_per_shot", 0)
+                allowed = (sid in policy.get("shot_ids", []) and count < retake_limit(policy, sid)
                     if is_repair else sid in plan.get("new_shots", []) + plan.get("retake_shots", []) and sid not in self.record["reserved_shots"])
                 if not allowed: raise ValueError("镜头不在当前冻结计划或授权次数已用完")
                 if is_repair: self.record["repair_reservations"][sid] = count + 1
@@ -227,7 +244,10 @@ class PiLoop:
         self.record["messages"].append({"role":"user","content":json.dumps({"type":"tool_result","tool":name,"ok":True,"result":result},ensure_ascii=False)})
         self.save()
         reason = self.pause_check() if self.pause_check else None
-        if reason: self.outcome = ("needs_input", reason, None)
+        if isinstance(reason, dict):
+            self.outcome = ("needs_input", reason["summary"], {"complete":False, "reason":reason["reason"]})
+        elif reason:
+            self.outcome = ("needs_input", reason, None)
         return {"result":tool.context_result(result) if tool.context_result else result,"current_state":self.state()}
 
     def run(self, goal, *, max_steps=18, max_video_generations=0, shooting_plan=None, resume=False):
@@ -265,6 +285,9 @@ class PiLoop:
         prior = json.loads(old_path.read_text("utf-8")) if old_path.exists() else None
         if prior and not resume: raise ValueError("已有任务必须明确恢复，不得覆盖或重放")
         if prior:
+            if (self.session_file and prior.get("video_generations") and prior.get("session_file")
+                    and Path(self.session_file).resolve() != Path(prior["session_file"]).resolve()):
+                raise ValueError("制作会话与已付款委托的原会话不一致，须核实原任务")
             persist(self.directory / ("before-pi-resume-" + digest_json(prior)[:16] + ".json"), prior)
             if prior.get("goal") != goal or prior.get("shooting_plan") != shooting_plan:
                 raise ValueError("恢复目标或冻结计划不匹配")
@@ -301,6 +324,10 @@ class PiLoop:
         catalog.append({"name":"finish_task","description":"制作交付用completed并通过独立门禁；普通咨询已回答用responded，仅结束对话轮次；真实受阻用needs_input。",
             "parameters":{"type":"object","properties":{"outcome":{"type":"string","enum":["completed","needs_input","responded"]},
             "summary":{"type":"string","minLength":1,"maxLength":4000}},"required":["outcome","summary"]}})
+        if self.creative_input_check is not None:
+            from .creative_input import QUESTION_SCHEMA
+            catalog[-1]["parameters"]["properties"]["creative_input"] = QUESTION_SCHEMA
+            catalog[-1]["description"] += " 未起稿且作者明确要求等本人补充资料后再写时，用needs_input并提交creative_input（topic、source_quote原话，作者给出的备选可填choices）。普通创作空白自行处理。"
         config = {"cwd":str(ROOT),"agentDir":str(agent_dir),"sessionDir":str(session_dir),
             "sessionFile":self.session_file or (prior or {}).get("session_file"),"baseUrl":base_url,"token":gateway.token,
             "model":gateway.model,"maxTokens":self.client.config.max_tokens,"tools":catalog,"system":SYSTEM+"\n"+self.system_prompt,
@@ -350,7 +377,11 @@ class PiLoop:
                         event("pi.sdk.ready",body,kind="agent")
                         if self.on_ready:self.on_ready(body)
                         result={"accepted":True}
-                    elif method=="tool": result=self.execute(body["name"],body["args"],body["toolCallId"])
+                    elif method=="tool":
+                        result=self.execute(body["name"],body["args"],body["toolCallId"])
+                        if self.outcome and (self.outcome[2] or {}).get("reason") == "acceptance_retake_limit":
+                            send({"type":"reply","id":data["id"],"result":result})
+                            break
                     elif method=="event":
                         event("pi.session.event",body,kind="agent")
                         if self.on_event:self.on_event(body)
@@ -377,11 +408,15 @@ class PiLoop:
             fatal_error=exc
             raise
         except Exception as exc:
-            if self.outcome and gateway.failure_purpose=="compaction":
+            if self.outcome and (self.outcome[2] or {}).get("reason") == "acceptance_retake_limit":
+                status,summary,check=self.outcome
+            elif self.outcome and gateway.failure_purpose=="compaction":
                 status,summary,check=self.outcome
                 self.record["context_maintenance"]={"status":"incomplete","error":str(exc),
                     "original_session_retained":True,"automatic_retry":False}
-            else:status,summary,check="needs_input",str(exc),None
+            else:
+                summary = gateway.failure_summary if exc is gateway.failure else None
+                status,summary,check="needs_input",summary or str(exc),None
             if self.cancelled and self.cancelled():status,summary="cancelled","已停止后续动作，已有结果与已提交的云端任务保留。"
             event("pi.run.stopped",{"type":type(exc).__name__,"reason":summary,"steps":self.record["steps"]},kind="error")
         finally:
@@ -408,7 +443,7 @@ class PiLoop:
             "video_generations":self.record["video_generations"],"completion_check":check,"backend":"pi",
             "context_maintenance":self.record.get("context_maintenance"),
             "session_file":self.record.get("session_file"),"session_id":self.record.get("session_id"),
-            "report_path":str(old_path),"journal_path":self.record.get("session_file"),"reason":None if status in {"completed","responded"} else (self.record.get("failure") or {}).get("reason","pi_stopped")}
+            "report_path":str(old_path),"journal_path":self.record.get("session_file"),"reason":None if status in {"completed","responded"} else (self.record.get("failure") or check or {}).get("reason","pi_stopped")}
         self.record.update(status=status,result=result);self.save()
         return result
 

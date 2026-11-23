@@ -19,11 +19,16 @@ class SessionRepository:
               UNIQUE(story_id,role));
             CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,
               role TEXT NOT NULL,text TEXT NOT NULL,status TEXT NOT NULL,job_id TEXT,trace_id TEXT,
-              mode TEXT NOT NULL DEFAULT 'work',
+              mode TEXT NOT NULL DEFAULT 'work',continue_commission TEXT,creative_answer TEXT,
               created_at TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%fZ','now')));
             """)
-            if "mode" not in {r[1] for r in db.execute("PRAGMA table_info(messages)")}:
+            columns={r[1] for r in db.execute("PRAGMA table_info(messages)")}
+            if "mode" not in columns:
                 db.execute("ALTER TABLE messages ADD COLUMN mode TEXT NOT NULL DEFAULT 'work'")
+            if "continue_commission" not in columns:
+                db.execute("ALTER TABLE messages ADD COLUMN continue_commission TEXT")
+            if "creative_answer" not in columns:
+                db.execute("ALTER TABLE messages ADD COLUMN creative_answer TEXT")
 
     @contextmanager
     def db(self):
@@ -63,17 +68,19 @@ class SessionRepository:
                 db.execute("UPDATE sessions SET "+",".join(k+"=?" for k in fields)+" WHERE id=?",(*fields.values(),session_id))
 
     @traced("pi.messages.append",kind="tool",capture_inputs=False)
-    def append(self, session_id, role, text, *, message_id=None, status="queued", job_id=None, trace_id=None, mode="work"):
+    def append(self, session_id, role, text, *, message_id=None, status="queued", job_id=None, trace_id=None, mode="work", continue_commission=None, creative_answer=None):
         if mode not in {"work","inspect"}:raise ValueError("Invalid conversation permission mode")
         message_id=message_id or uuid.uuid4().hex
         text=get_tracer().sanitize(text)
         with self.db() as db:
             prior=db.execute("SELECT * FROM messages WHERE id=?",(message_id,)).fetchone()
             if prior:
-                if prior["session_id"]!=session_id or prior["text"]!=text or prior["role"]!=role or prior["mode"]!=mode:raise ValueError("消息标识已用于其他内容或权限范围")
+                if (prior["session_id"]!=session_id or prior["text"]!=text or prior["role"]!=role
+                        or prior["mode"]!=mode or prior["continue_commission"]!=continue_commission or prior["creative_answer"]!=creative_answer):
+                    raise ValueError("消息标识已用于其他内容或权限范围")
                 return dict(prior)
-            db.execute("INSERT INTO messages(id,session_id,role,text,status,job_id,trace_id,mode) VALUES(?,?,?,?,?,?,?,?)",
-                (message_id,session_id,role,text,status,job_id,trace_id,mode))
+            db.execute("INSERT INTO messages(id,session_id,role,text,status,job_id,trace_id,mode,continue_commission,creative_answer) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (message_id,session_id,role,text,status,job_id,trace_id,mode,continue_commission,creative_answer))
             row=db.execute("SELECT * FROM messages WHERE id=?",(message_id,)).fetchone()
         return dict(row)
 
@@ -93,6 +100,12 @@ class SessionRepository:
             rows=[dict(r) for r in db.execute("SELECT * FROM sessions WHERE active_job IS NOT NULL")]
         # The application process lock proves the previous service is gone.
         for row in rows:
+            # A button operation belongs to its worker, never to a native chat steering event.
+            # Keep a command abandoned with that worker distinct from those still waiting behind it.
+            with self.db() as db:
+                db.execute("UPDATE messages SET status='interrupted' WHERE session_id=? AND job_id=? "
+                           "AND (continue_commission IS NOT NULL OR creative_answer IS NOT NULL) AND status IN ('queued','dispatching')",
+                           (row["id"],row["active_job"]))
             self.reconcile(row["id"]);self.update(row["id"],active_job=None)
         return {"recovered_sessions":len(rows),"replayed_paid_operations":0}
 
@@ -108,6 +121,7 @@ class SessionRepository:
                     observed.append(json.dumps(message.get("content"),ensure_ascii=False))
         text="\n".join(observed)
         for message in self.messages(session_id):
-            if message["id"] not in exclude_ids and message["role"] in {"user","agent"} and message["status"] in {"queued","dispatching"}:
+            if (not message["continue_commission"] and not message["creative_answer"] and message["id"] not in exclude_ids
+                    and message["role"] in {"user","agent"} and message["status"] in {"queued","dispatching"}):
                 self.delivered(message["id"],"delivered" if "[message_id="+message["id"]+"]" in text else "queued")
         return {"observed_user_entries":len(observed),"replayed_operations":0}

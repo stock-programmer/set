@@ -17,6 +17,56 @@ from trace_system import TraceError, Tracer, use_context
 
 
 class RouteTests(unittest.TestCase):
+    def test_openai_ark_project_has_no_bailian_fallback(self):
+        from pianchang.app_service import AppService
+        from pianchang.bailian_video import BailianVideoClient, config_for_references, load_config
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = root / ".env"
+            config = root / "config/models.json"
+            config.parent.mkdir()
+            sample = Path(__file__).resolve().parents[1] / "config/models.example.json"
+            settings = json.loads(sample.read_text("utf-8"))
+            settings["disabled_providers"] = ["aliyun-bailian"]
+            settings["models"]["test-review"] = {
+                "connection": "openai-art", "adapter": "openai", "model_id": "test-review"}
+            settings["models"]["test-chat"] = {
+                "connection": "openai-art", "adapter": "litellm", "sdk_provider": "openai", "model_id": "test-chat"}
+            settings["routes"] = dict.fromkeys(
+                ("script.decision", "video.decision", "story.compile", "reference.prompt", "voice.casting",
+                 "video.repair_strategy", "voice.synthesis"), "test-chat")
+            settings["routes"].update(dict.fromkeys(("vision.review", "continuity.review", "voice.review"), "test-review"))
+            settings["routes"].update({"reference.image": "gpt-reference-image", "video.text_to_video": "seedance-reference-video",
+                                       "video.reference_to_video": "seedance-reference-video"})
+            config.write_text(json.dumps(settings), encoding="utf-8")
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "fake-openai-key", "ARK_VIDEO_API_KEY": "fake-ark-key",
+                                         "DASHSCOPE_API_KEY": "", "AGENT_TRACE_DIR": str(root / "traces")}):
+                service = AppService(root)
+                try:
+                    routes = service.bootstrap(include_jobs=False)["config"]["model_routes"]
+                    self.assertEqual(len(routes), 13)
+                    self.assertEqual({p for p, r in routes.items() if r["provider"] == "volcengine-ark"},
+                                     {"video.text_to_video", "video.reference_to_video"})
+                    self.assertEqual(sum(r["provider"] == "openai" for r in routes.values()), 11)
+                    self.assertTrue(all(r["key_configured"] for r in routes.values()))
+                    self.assertNotIn("fake-openai-key", json.dumps(routes))
+                finally:
+                    service.close()
+                with patch.dict(os.environ, {"DASHSCOPE_API_KEY": "old-local-key"}):
+                    old_config = load_config(env, allow_missing=True)
+                    with self.assertRaisesRegex(ValueError, "已.*禁用"):
+                        config_for_references(old_config, [], legacy=True)
+                    client = BailianVideoClient(old_config)
+                    with patch.object(client._api_opener, "open") as http:
+                        with self.assertRaisesRegex(ValueError, "已.*禁用"):
+                            client.get_task("old-task")
+                        http.assert_not_called()
+                incomplete = json.loads(config.read_text("utf-8"))
+                del incomplete["routes"]["voice.review"]
+                config.write_text(json.dumps(incomplete), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "voice.review.*禁用"):
+                    load_routes(env)
+
     def test_workbench_reports_each_purpose_without_exposing_credentials(self):
         from pianchang.app_service import AppService
         with tempfile.TemporaryDirectory() as tmp:
@@ -80,6 +130,28 @@ class RouteTests(unittest.TestCase):
                     config.write_text(raw)
                     load_routes(root / ".env")
 
+    def test_image_size_belongs_to_image_model_and_survives_config_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "config/models.json"
+            config.parent.mkdir()
+            sample = Path(__file__).resolve().parents[1] / "config/models.example.json"
+            settings = json.loads(sample.read_text("utf-8"))
+            alias = settings["routes"]["reference.image"]
+            model = settings["models"][alias]
+            model["image_size"] = "2K"
+            config.write_text(json.dumps(settings), encoding="utf-8")
+            original = load_routes(root / ".env").resolve("reference.image").snapshot()
+            model["image_size"] = "1024x1024"
+            config.write_text(json.dumps(settings), encoding="utf-8")
+            registry = load_routes(root / ".env")
+            self.assertEqual(registry.resolve("reference.image").image_size, "1024x1024")
+            self.assertEqual(registry.restore(original).image_size, "2K")
+            settings["routes"]["video.decision"] = alias
+            config.write_text(json.dumps(settings), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "video.decision.*image_size"):
+                load_routes(root / ".env")
+
 
 @unittest.skipUnless(importlib.util.find_spec("litellm"), "optional LiteLLM SDK")
 class SDKTransportTests(unittest.TestCase):
@@ -121,6 +193,7 @@ class SDKTransportTests(unittest.TestCase):
             "finish_reason": "stop"}]}, messages=[{"role": "user", "content": "test"}])
         self.assertEqual(path, "/v1/chat/completions")
         self.assertEqual(result["choices"][0]["message"]["content"], "ok")
+        self.route = replace(self.route, model_id="gpt-image-2.5-flare")
         path, result = self.run_sdk("image_generation", {"created": 1, "data": [{"b64_json": "dGVzdA=="}]},
                                     prompt="test", n=1, size="1024x1024")
         self.assertEqual(path, "/v1/images/generations")

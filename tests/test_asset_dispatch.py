@@ -31,6 +31,7 @@ class AssetDispatchTests(unittest.TestCase):
         self.project = read_json(Path(__file__).resolve().parents[1] / "fixtures" / "story_project.json")
         write_json(root / "fixtures" / "story_project.json", self.project)
         self.service = AppService(root)
+        self.enterContext(self.service.tracer.storage_session())
         self.addCleanup(self.service.close)
         self.pid = next(iter(self.service._discover()))
         tracer = use_context(None, tracer=self.service.tracer)
@@ -44,6 +45,11 @@ class AssetDispatchTests(unittest.TestCase):
 
     def wait_job(self, kind, body, key=None):
         job = self.service.submit(kind,self.pid,body,key)
+        with self.service.lock:
+            queued = self.service._asset_futures.get(self.pid)
+        if queued and queued[0] == job["id"]:
+            queued[1].result(timeout=180)
+            return next(j for j in self.service.list_jobs() if j["id"] == job["id"])
         for _ in range(200):
             current = next(j for j in self.service.list_jobs() if j["id"] == job["id"])
             if current["status"] not in {"queued","running"}:
@@ -452,3 +458,92 @@ class AssetDispatchTests(unittest.TestCase):
             self.assertEqual(next(i for i in state["items"] if i["status"]=="approved")["selected_pin"],pin)
         with self.assertRaisesRegex(ValueError,"S002"):
             check_video_asset_readiness(self.service,self.pid,self.project)
+
+    def test_new_and_historical_model_refusals_explain_the_action_without_resubmission(self):
+        import copy
+        model = "doubao-seedream-5-0-260128"
+        message = f"Error code: 404 - The model or endpoint {model} does not exist or you do not have access to it."
+
+        def refuse(service, pid, request, **kwargs):
+            if request["purpose"] == "voice":
+                raise ValueError("offline voice timeout")
+            error = ValueError(message)
+            error.rejected_image_model = model
+            raise error
+
+        with patch("pianchang.asset_review.run_reference_loop", side_effect=refuse) as generate:
+            job = self.wait_job("asset_production", {})
+            diagnostics = job["asset_diagnostics"]
+            blocked = [i for i in diagnostics["items"] if i["purpose"] != "voice"]
+            self.assertTrue(blocked)
+            self.assertTrue(all(i["code"] == "image_model_access" and i["model_id"] == model for i in blocked))
+            self.assertIn(f"{model}（{len(blocked)} 项）", job["result"]["summary"])
+            self.assertIn("回应请求", job["message"])
+            calls = generate.call_count
+
+            past = copy.deepcopy(job)
+            saved = past["result"]["asset_diagnostics"]
+            saved["summary"] = "已处理资产。"
+            for issue in saved["items"]:
+                if issue.pop("code", None):
+                    issue.pop("model_id")
+                    issue.update(stage="unknown", verdict="UNKNOWN", reason="资产任务停在这条错误记录：" + message[:104] + "…")
+            with self.service.lock:
+                work = self.service.state["asset_work"][self.pid]["items"]
+                for row in work.values():
+                    row.pop("rejected_image_model", None)
+                # Simulate one superseded work item. Its original trace still holds the failure.
+                old = next(row for row in work.values() if row["purpose"] == "portrait")
+                old.update(job_id="later-order", error="unrelated later error")
+            restored = self.service._asset_job_diagnostics(past)
+            self.assertEqual(restored["items"], diagnostics["items"])
+            self.assertIn("404", restored["summary"])
+            self.assertEqual(saved["summary"], "已处理资产。")
+            self.assertEqual(generate.call_count, calls)
+
+    def test_image_recovery_order_deduplicates_and_keeps_each_generated_image_if_inspection_fails(self):
+        from types import SimpleNamespace
+        model = "ep-offline-recovered"
+        def refuse(service, pid, body, **kw):
+            exc = ValueError("fixture HTTP 404")
+            if body["purpose"] != "voice":
+                exc.rejected_image_code = "ModelNotOpen"
+                exc.rejected_image_model = "offline-original"
+            raise exc
+        with patch("pianchang.asset_review.run_reference_loop", side_effect=refuse):
+            original = self.wait_job("asset_production", {})
+        items = [{"subject_id":i["subject_id"], "purpose":i["purpose"], "job_id":original["id"], "remaining_attempts":2}
+                 for i in original["asset_diagnostics"]["items"] if i.get("code") == "image_model_access"]
+        self.assertGreater(len(items), 1)
+        route = SimpleNamespace(model_id=model, api_key="offline", snapshot=lambda:{"model_id":model})
+        evidence = {"human_intervention":{"kind":"reference_image_model_access","items":items}}
+        entered, release = threading.Event(), threading.Event()
+        def generate(service, pid, body, **opts):
+            self.assertEqual(body["max_attempts"], 2)
+            self.assertNotEqual(body["purpose"], "voice")
+            entered.set()
+            if not release.wait(90):
+                raise AssertionError("fixture did not release the first image")
+            opts["on_generated"]({"asset_id":"fixture/"+body["subject_id"],"revision_id":"r1","subject_id":body["subject_id"],
+                                  "purpose":body["purpose"],"sha256":"c"*64,"media_sha256":"d"*64})
+            raise ValueError("offline inspection unavailable after successful image import")
+        body = {"resume_images_from":original["id"], "model_id":model}
+        with patch("pianchang.image_recovery.load_routes", return_value=SimpleNamespace(resolve=lambda purpose:route)), \
+                patch("tools.workbench_loop_dependency.recheck_dependency", return_value=evidence), \
+                patch("pianchang.asset_review.run_reference_loop", side_effect=generate) as generated:
+            child = self.service.submit("asset_production", self.pid, body, "caller-chosen-key")
+            try:
+                self.assertTrue(entered.wait(90))
+                duplicate = self.service.submit("asset_production", self.pid, body, "a-different-caller-key")
+                self.assertEqual(child["id"], duplicate["id"])
+            finally:
+                release.set()
+            with self.service.lock:
+                future = self.service._asset_futures[self.pid][1]
+            future.result(timeout=120)
+            finished = self.service.submit("asset_production", self.pid, body)
+        self.assertEqual(child["id"], finished["id"])
+        self.assertEqual(generated.call_count, len(items))
+        self.assertEqual(finished["result"]["image_recovery"]["generated"], len(items))
+        self.assertEqual(finished["result"]["image_recovery"]["selected"], 0)
+        self.assertTrue(all(i["candidate"] for i in finished["asset_diagnostics"]["items"]))

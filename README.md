@@ -60,7 +60,7 @@ S002 的报告列出 11 项通过、1 项失败、2 项未知。点开失败项�
 
 ![湖边的倒影的双 Agent 交接记录，显示剧本发布、制作委托及三轮改稿请求与回复](docs/images/lake-collaboration.png)
 
-**怎样决定一个镜头该不该重拍？** 资产自检看实际的图片和声音；视频验收再看实际片段的技术信息、人物、道具、动作与衔接。检查结果分为通过、失败和证据不足。制作 Agent 可以在委托额度内局部编辑、重拍和复验，保留每轮候选及停止原因，人工可以查看每次判断的依据。
+**怎样决定一个镜头该不该重拍？** 视频 Agent 检查实际片段的人物、道具、动作和衔接。每个镜头验收未通过时最多自动重拍一次。复验仍未通过，控制台会打印失败理由。在「视频制作 → 审看镜头与人工通过」播放当前版本，认可画面后点「人工通过」。所有镜头、相邻衔接及文件检查通过后，即可播放剪好的成片。[镜头制作与人工验收](docs/WORKBENCH_GUIDE.md#启动片场并制作短剧)
 
 ## 快速开始（macOS 和 Windows）
 
@@ -71,8 +71,8 @@ S002 的报告列出 11 项通过、1 项失败、2 项未知。点开失败项�
 | Windows | 在资源管理器双击 **`启动片场.cmd`**。如果缺少 Python 3.11 或更高版本，可按窗口提示用 winget 安装，或打开 Python 官方下载页。 |
 | macOS | 在访达双击 **`启动片场.command`**。缺少 Python 3.11 或更高版本时，按提示打开官方下载页，安装后再次双击。 |
 
-- **先看示例。** 首次启动会从 `.env.example` 创建本机的 `.env`。在百炼 Key 提示处直接按回车，浏览器打开后选《最后一把钥匙》，即可阅读剧本和已有镜头。
-- **只用百炼。** 在启动窗口粘贴自己的百炼北京地域 API Key，输入时字符会隐藏。也可以在项目目录的 `.env` 填写 `DASHSCOPE_API_KEY`。这条路径使用百炼原生客户端，无需创建 `models.json` 或安装 LiteLLM。[获取百炼 API Key](https://help.aliyun.com/zh/model-studio/get-api-key)
+- **先看示例。** 首次启动会从 `.env.example` 创建本机的 `.env`。浏览器打开后选《最后一把钥匙》，即可阅读剧本和已有镜头。
+- **使用旧版百炼工程。** 仅有 `.env`、没有 `config/models.json` 的工程沿用原有百炼设置，可在启动窗口填写北京地域 API Key。[获取百炼 API Key](https://help.aliyun.com/zh/model-studio/get-api-key)
 - **不同环节用不同模型。** 例如沿用千问写剧本，只把人物定妆照交给 OpenAI，或让带参考素材的镜头使用 Seedance。按下文配置后，在工作台就能核对每一项选中的模型。[配置多个模型和供应商](#配置多个模型和供应商)
 
 在线使用两个 Agent 需要 Node.js 22.19 或更高版本及 npm。配置了任一 Agent 的对话 Key 后，再次双击启动器会检查并按需安装 Pi 依赖。检查媒体和导出成片还需要 FFmpeg、ffprobe。Mac 提示文件无法打开、Windows 找不到 Python，或浏览器未自动打开时，可查看[首次配置与启动排障](docs/WORKBENCH_GUIDE.md#启动与首次配置)。
@@ -90,7 +90,7 @@ GEMINI_API_KEY=
 ARK_VIDEO_API_KEY=
 ```
 
-例如，只把参考图切换到 OpenAI，就填写 `OPENAI_API_KEY`，其余百炼环节继续使用原有的 `DASHSCOPE_API_KEY`。每个账户都可以有自己的变量名，也可以使用同名系统环境变量，其值优先于 `.env`。真实 Key 只保存在本机。
+项目当前的 [models.json](config/models.json) 使用火山方舟 Seedream 5.0 Pro（`doubao-seedream-5-0-pro-260628`）生成人物、场景和道具参考图，Seedance 2.0 mini 生成镜头，两者共用 `ark-production` 连接。OpenAI 负责剧本、制作决策、声音和验收。填写 `OPENAI_API_KEY` 和 `ARK_VIDEO_API_KEY` 后，在页面顶部的密钥状态查看各用途、模型和配置状态。同名系统环境变量优先于 `.env`。密钥状态只表示片场读到了值，模型权限由实际调用确认。
 
 只用百炼时也可以在 `.env` 换型号。`BAILIAN_TEXT_MODEL` 设置默认文本模型，`BAILIAN_VIDEO_MODEL` 设置普通视频模型，`BAILIAN_REFERENCE_VIDEO_MODEL` 设置带参考素材的视频模型，`BAILIAN_VISION_MODEL` 设置默认视觉观察模型。百炼文本和媒体分别使用 `BAILIAN_TEXT_BASE_URL` 和 `DASHSCOPE_BASE_URL`。使用北京地域时可沿用 [.env.example](.env.example) 的地址。
 
@@ -129,10 +129,13 @@ ARK_VIDEO_API_KEY=
 | 配置项 | 应该填什么 |
 | --- | --- |
 | `version`、`extends` | 使用格式版本 `1`。`"extends": "bailian"` 表示继承百炼设置，`routes` 只写想更换的用途。 |
+| `disabled_providers` | 当前为 `["aliyun-bailian"]`。漏配任何仍指向百炼的用途，加载配置会指出该用途。 |
 | `connections` | 每个连接起一个名字，如 `openai-art`。`provider` 标记供应商，`account` 是自己给这份账户取的稳定名称。同一供应商有两个账户时，各建一个连接。 |
 | `base_url`、`api_key_env` | `base_url` 填供应商提供的 HTTPS API 根地址，保留版本路径，如 `/v1`。`api_key_env` 填上一步的**变量名**，如 `OPENAI_API_KEY`。 |
 | `models`、`connection`、`model_id` | 为模型起一个片场内使用的别名，如 `gpt-reference-image`。`connection` 引用上面的连接名，`model_id` 填供应商控制台里的实际型号或接入点 ID。多个模型可以共用一个连接和 Key。 |
-| `adapter`、`sdk_provider` | `adapter` 填 `bailian` 时使用百炼原生客户端，填 `litellm` 时使用 Python SDK 并指定协议名 `sdk_provider`。示例里 Gemini 的 OpenAI 兼容对话与 OpenAI 生图都用 `openai`，方舟视频用 `volcengine`。 |
+| `image_size` | Images 接口的可选输出尺寸。当前 Seedream 5.0 使用 `2048x2048`。 |
+| `image_response_format` | 参考图模型的可选返回格式。当前 Seedream 使用 `b64_json`，工作台从生成响应中直接读取原图。支持临时下载链接的接口也可配置 `url`。省略时使用供应商默认格式。 |
+| `adapter`、`sdk_provider` | `litellm` 使用项目的 SDK 传输层，并指定协议名 `sdk_provider`。方舟视频用 `volcengine`，OpenAI 对话、生图和语音输出用 `openai`。原生审查接口使用 `adapter: "openai"`；旧百炼工程使用 `adapter: "bailian"`。 |
 | `routes` | 左边是片场的用途，右边是已定义的模型别名。要把参考图切回百炼，可以把 `reference.image` 的值改为内置别名 `bailian.image`。 |
 
 | 想更换的环节 | 在 `routes` 中设置 |
@@ -141,8 +144,12 @@ ARK_VIDEO_API_KEY=
 | 人物、道具和场景参考图 | `reference.image` |
 | 普通视频、使用固定参考素材的视频 | 分别设置 `video.text_to_video`、`video.reference_to_video` |
 | 分镜编译、参考图提示词、声音选角、重拍策略 | 分别设置 `story.compile`、`reference.prompt`、`voice.casting`、`video.repair_strategy` |
+| 角色试音、声音验收 | 分别设置 `voice.synthesis`、`voice.review` |
+| 图像与镜头画面验收、相邻镜头声画验收 | 分别设置 `vision.review`、`continuity.review` |
 
-例如，希望 Gemini 同时负责剧本对话和分镜编译，就把 `script.decision` 和 `story.compile` 都指向模板里的 `gemini-writer`。语音合成、声音审查、视觉审查和相邻镜头验收目前使用百炼原生适配器，完整制作流程仍需为这些用途配置百炼凭据。[全部用途与已接协议](docs/MULTI_PROVIDER_MODEL_GATEWAY.md#可配置的用途)
+更换同一接口下的兼容模型时，修改别名对应的 `model_id`。只改一个用途时，创建新别名并修改对应的 `routes` 项。例如，`video.decision` 可以单独选择视频 Agent 的决策模型。[全部用途与已接协议](docs/MULTI_PROVIDER_MODEL_GATEWAY.md#可配置的用途)
+
+Windows 上，SDK 会使用「设置 → 网络和 Internet → 代理」中已启用的手动代理，并遵守代理例外地址。代理设置变更在下一次请求生效；无需把代理地址写入模型 `base_url`。此接入不执行 PAC 自动配置脚本。[代理接入说明](docs/MULTI_PROVIDER_MODEL_GATEWAY.md)
 
 ### 3. 安装 SDK 并确认配置生效
 
@@ -214,3 +221,7 @@ python -m tools.check_trace_contract
 python -m unittest discover -s tests
 node tests/ui/test_navigation_ui.cjs
 ```
+
+## 用浏览器追踪 Agent 任务
+
+工作台启动后会自动监听网页上的剧本、制作和资产任务。任务失败时，在「制作动态」查看旁路查到了什么、正在修复什么。方舟生图模型被拒绝后，旁路先查模型和接入点，能修正路由就自动修正，再按原委托补做缺图。需要账号权限、接入点 ID 或拍摄决定时，工作台弹出对应的问题。可在弹窗内提供资料，或进入拍摄计划审核版本与额度。关闭后可从「制作动态 → 回应请求」重新打开。[启动与恢复旁路](docs/WORKBENCH_GUIDE.md#开发旁路)

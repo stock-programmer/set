@@ -3,9 +3,12 @@ import hashlib
 import json
 import os
 import ssl
+import sys
+from contextlib import ExitStack
 from importlib.metadata import PackageNotFoundError, version
 from types import SimpleNamespace
-from urllib.parse import urlsplit
+from urllib import request as urllib_request
+from urllib.parse import unquote, urlsplit
 from urllib.request import Request
 
 from pianchang.bailian_video import _trace_http_request, _trace_http_response
@@ -17,11 +20,104 @@ class SDKSetupError(RuntimeError):
     network_dispatched = False
 
 
+class _WindowsProxyTransport:
+    """Use Windows proxy settings while retaining the existing TLS policy."""
+
+    def __init__(self, tls):
+        self.tls = tls
+        self.transports = {}
+
+    def handle_request(self, req):
+        import httpx
+        proxy = urllib_request.getproxies_registry().get(req.url.scheme)
+        if proxy:
+            # Register credentials before constructing the transport or recording
+            # errors; HTTP libraries can include proxy addresses in exceptions.
+            register_secret(proxy)
+            address = urlsplit(proxy)
+            # Usernames are account labels (often simply "user"); registering
+            # them globally would also erase unrelated message roles in Trace.
+            if address.password:
+                register_secret(address.password)
+                register_secret(unquote(address.password))
+            if urllib_request.proxy_bypass_registry(req.url.host):
+                proxy = None
+        address = urlsplit(proxy) if proxy else None
+        self.selected_route = {
+            "source": "windows", "target_host": req.url.host,
+            "mode": "proxy" if proxy else "direct",
+            "proxy_scheme": address.scheme if address else None,
+            "proxy_host": address.hostname if address else None,
+            "proxy_port": address.port if address else None,
+        }
+        event("http.proxy.selected", self.selected_route, kind="http")
+        if proxy not in self.transports:
+            self.transports[proxy] = httpx.HTTPTransport(
+                verify=self.tls, proxy=proxy, retries=0, trust_env=False)
+        return self.transports[proxy].handle_request(req)
+
+    def close(self):
+        with ExitStack() as cleanup:
+            for transport in self.transports.values():
+                cleanup.callback(transport.close)
+            self.transports.clear()
+
+
 def _upstream_transport():
     import httpx
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     tls.load_default_certs()
+    if sys.platform == "win32":
+        return _WindowsProxyTransport(tls)
     return httpx.HTTPTransport(verify=tls, retries=0, trust_env=False)
+
+
+class _DispatchEvidence:
+    """Observe httpcore's synchronous wire boundaries without retaining its request or headers."""
+
+    def __init__(self, prior):
+        self.prior = prior
+        self.phase = "unknown"
+        self.origin_started = False
+        self.connection_failure = None
+
+    def __call__(self, name, info):
+        if self.prior is not None:
+            self.prior(name, info)
+        parts = name.split(".")
+        if len(parts) != 3:
+            return
+        prefix, phase, outcome = parts
+        if prefix in {"connection", "proxy"} and phase in {"connect_tcp", "start_tls"}:
+            self.phase = phase
+            self.connection_failure = info.get("exception") if outcome == "failed" else None
+        elif prefix in {"http11", "http2"} and outcome == "started":
+            if phase == "send_request_headers":
+                # A proxy CONNECT sets up a tunnel; it carries none of the model request.
+                if getattr(info.get("request"), "method", None) == b"CONNECT":
+                    return
+                self.origin_started = True
+            if self.origin_started and phase in {"send_request_headers", "send_request_body",
+                                                 "receive_response_headers", "receive_response_body"}:
+                self.phase = phase
+
+    def error(self, exc):
+        import httpx
+        not_sent = (not self.origin_started and self.connection_failure is not None
+                    and self.connection_failure is exc.__cause__
+                    and isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)))
+        result = {"error_type": type(exc).__name__, "phase": self.phase,
+                  "dispatch": "not_sent" if not_sent else "unknown"}
+        cause = exc
+        for _ in range(8):
+            if cause is None:
+                break
+            if isinstance(cause, ssl.SSLError) and getattr(cause, "reason", None):
+                result["ssl_reason"] = cause.reason
+            if isinstance(cause, OSError) and type(getattr(cause, "winerror", None)) is int:
+                result["winerror"] = cause.winerror
+            cause = cause.__cause__
+        return result
 
 
 class _Wire:
@@ -79,10 +175,19 @@ class _Wire:
         _trace_http_request(Request(url, method=method, data=data, headers=dict(req.headers)), self.timeout)
         digest = hashlib.sha256(data).hexdigest() if data is not None else None
         if self.before_send:
-            self.before_send(method, url, json.loads(data) if data is not None else None, digest)
+            try:
+                self.before_send(method, url, json.loads(data) if data is not None else None, digest)
+            except TraceError:
+                raise
+            except Exception as exc:
+                event("http.error", {"error_type": type(exc).__name__, "phase": "before_send",
+                                     "dispatch": "not_sent"}, kind="http")
+                raise
         self.sent += 1
         if data is not None:
             self.receipt.update(trace_context=current_context(), wire_body_sha256=digest)
+        dispatch = _DispatchEvidence(req.extensions.get("trace"))
+        req.extensions["trace"] = dispatch
         try:
             response = self.upstream.handle_request(req)
             try:
@@ -110,8 +215,15 @@ class _Wire:
                     captured_digest = hashlib.sha256(raw).hexdigest()
             finally:
                 response.close()
+        except TraceError:
+            raise
         except Exception as exc:
-            event("http.error", {"error_type": type(exc).__name__}, kind="http")
+            proof = dispatch.error(exc)
+            event("http.error", proof, kind="http")
+            if proof["dispatch"] == "not_sent" and self.sent == 1:
+                exc.network_dispatched = False
+            if data is not None:
+                exc.wire_receipt = {**self.receipt, **proof}
             raise
         if download:
             event("http.response", {"http_status": response.status_code, "captured_bytes": len(raw),
@@ -129,7 +241,16 @@ class _Wire:
             except (ValueError, UnicodeError):
                 obj = None
             if isinstance(obj, dict):
+                if self.operation == "image_generation" and isinstance(obj.get("error"), dict):
+                    from pianchang.asset_diagnostics import IMAGE_ACCESS_ERRORS
+                    code = obj["error"].get("code")
+                    if isinstance(code, str) and code in IMAGE_ACCESS_ERRORS and IMAGE_ACCESS_ERRORS[code] == response.status_code:
+                        self.receipt["provider_code"] = code
                 if self.operation == "image_generation" and isinstance(obj.get("data"), list):
+                    if isinstance(obj.get("model"), str) and obj["model"]:
+                        self.receipt["response_model"] = obj["model"]
+                    if type(obj.get("created")) is int and obj["created"] > 0:
+                        self.receipt["provider_created_at"] = obj["created"]
                     for image in obj["data"]:
                         image_url = image.get("url") if isinstance(image, dict) else None
                         if isinstance(image_url, str) and "?" in image_url:
@@ -195,7 +316,16 @@ def call_sdk(route, operation, *, timeout, before_send=None, **kwargs):
         else:
             raise SDKSetupError("SDK 协议尚未适配此模型操作")
         try:
-            result = getattr(litellm, operation)(**options, **kwargs)
+            if operation == "completion" and route.provider == "openai" and route.sdk_provider == "openai":
+                # The official client transmits the configured request without LiteLLM's
+                # optional local token estimation or external tokenizer downloads.
+                result = options["client"].chat.completions.create(model=route.model_id, **kwargs)
+            elif operation == "image_generation" and route.sdk_provider == "openai" and route.image_response_format:
+                # Compatible Images endpoints can support response_format even when
+                # LiteLLM applies the GPT Image parameter list to their model ID.
+                result = options["client"].images.generate(model=route.model_id, **kwargs)
+            else:
+                result = getattr(litellm, operation)(**options, **kwargs)
         except Exception as exc:
             if isinstance(wire.failure, TraceError):
                 raise wire.failure from None
@@ -214,6 +344,10 @@ def call_sdk(route, operation, *, timeout, before_send=None, **kwargs):
                 raise RuntimeError("无法核对原任务和实际视频下载回执")
             return result
         normalized = result.model_dump()
+        if operation == "image_generation" and wire.receipt.get("response_model"):
+            # A compatible provider can return its resolved model ID even when
+            # the SDK's normalized ImagesResponse has no model field.
+            normalized["model"] = wire.receipt["response_model"]
         normalized.update(_wire_receipt=wire.receipt, _provider_request_id=wire.receipt.get("provider_request_id"),
                           _provider_task_id=wire.receipt.get("provider_task_id"))
         return normalized

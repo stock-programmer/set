@@ -60,6 +60,9 @@ def _now():
 
 def _validate(value, schema, path="arguments", depth=0):
     """Small explicit schema subset for the registered tool contracts."""
+    if schema == {}:
+        # The empty JSON Schema accepts any JSON value.
+        return
     if depth > 12:
         raise AgentLoopError(path + ": 参数嵌套过深")
     kind = schema.get("type")
@@ -250,12 +253,15 @@ class AgentLoop:
             allowed_shots = set(groups[0] + groups[1])
             video_limit = len(allowed_shots)
             if repair_policy:
+                from pianchang.video_repair import authorized_video_count, retake_limit
                 if (repair_policy.get("version") != "acceptance-loop/1"
                         or set(repair_policy.get("shot_ids", [])) != set(shots)
                         or type(repair_policy.get("max_repairs_per_shot")) is not int
                         or not 0 <= repair_policy["max_repairs_per_shot"] <= 6):
                     raise AgentLoopError("自动验收修复策略无效。")
-                video_limit += len(shots) * repair_policy["max_repairs_per_shot"]
+                # Historical checkpoints keep their signed allocation; dispatch still enforces the current per-shot ceiling.
+                video_limit = (authorized_video_count(shooting_plan) if repair_policy["max_repairs_per_shot"] <= 1
+                               else video_limit + len(shots) * repair_policy["max_repairs_per_shot"])
             if max_video_generations != video_limit:
                 raise AgentLoopError("视频提交次数必须与已批准的拍摄计划一致。")
             max_step_limit = max(30, len(shots) * 2 + 8)
@@ -339,6 +345,8 @@ class AgentLoop:
                     return self._finish("cancelled", "任务已取消；已完成的工具输出保留。")
                 if self.maintain:
                     maintenance = self.maintain(self.record)
+                    if maintenance.get("terminal_summary"):
+                        return self._finish("needs_input", maintenance["terminal_summary"], reason="acceptance_retake_limit")
                     digest = hashlib.sha256(_json(maintenance).encode("utf-8")).hexdigest()
                     if digest != self._maintenance_digest:
                         self._message("user", {"type":"autonomous_work_queue", "result":maintenance})
@@ -425,7 +433,7 @@ class AgentLoop:
                         sid = arguments.get("shot_id")
                         is_repair = tool.name == "regenerate_shot" and repair_policy is not None
                         reserved = self.record["repair_reservations"].get(sid, 0)
-                        permitted = (sid in repair_policy["shot_ids"] and reserved < repair_policy["max_repairs_per_shot"]
+                        permitted = (sid in repair_policy["shot_ids"] and reserved < retake_limit(repair_policy, sid)
                                      if is_repair else sid in allowed_shots and sid not in self.record["reserved_shots"])
                         if not permitted or self._last_snapshot.get("project_ready") is False:
                             self._feedback(call_id, name, error={"code": "SHOT_OUTSIDE_PLAN",
@@ -471,7 +479,13 @@ class AgentLoop:
                 if self.pause_check:
                     reason = self.pause_check()
                     if reason:
+                        if isinstance(reason, dict):
+                            return self._finish("needs_input", reason["summary"], reason=reason["reason"])
                         return self._finish("needs_input", reason, reason="retake_approval_required")
+                if step == max_steps and self.maintain and self.stop_check:
+                    stopped = self.stop_check(self.record)
+                    if stopped.get("terminal_summary"):
+                        return self._finish("needs_input", stopped["terminal_summary"], reason="acceptance_retake_limit")
             return self._finish("budget_exhausted", "已达到本次模型决策步数上限；已有成果与待处理问题已保留。", reason="step_limit")
         except TraceError:
             raise

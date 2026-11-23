@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 from pianchang.acceptance import file_sha256, required_subtitle
 from pianchang.app_service import read_json
 from pianchang.bailian_text import TextConfig, TextError
-from pianchang.content_review import (normalize_observations, review_video, run_content_reviews,
+from pianchang.content_review import (internal_cut_windows, normalize_observations, review_video, run_content_reviews,
                             validate_content_evidence, VERSION, ContentObserver, cut_review_scope, prepare_cut)
 from pianchang.story_spec import digest_json
 from trace_system import Tracer, use_context, TraceError
@@ -18,6 +18,18 @@ from pianchang.studio_recovery import prepare_continuation, read_incomplete_prod
 
 
 class ContentNormalizationTests(unittest.TestCase):
+    def test_failed_creative_beat_can_locate_cut_only_with_ordered_video_evidence(self):
+        left = {"criterion_id": "creative:S001", "status": "FAIL", "execution_status": "executed",
+                "evidence": [{"asset_id": "V0", "start_s": 0, "end_s": 2.8}]}
+        right = {"criterion_id": "creative:S002", "status": "PASS", "execution_status": "executed",
+                 "evidence": [{"asset_id": "V0", "start_s": 2.9, "end_s": 8.9}]}
+        def locate(a, b):
+            return internal_cut_windows(("S001", "S002"), [a, b])
+        self.assertEqual(locate(left, right), ((0, 2.8), (2.9, 8.9)))
+        self.assertIsNone(locate({**left, "execution_status": "evidence_invalid"}, right))
+        self.assertIsNone(locate({**left, "evidence": [{"asset_id": "R0"}]}, right))
+        self.assertIsNone(locate(left, {**right, "evidence": [{"asset_id": "V0", "start_s": 2, "end_s": 5}]}))
+
     def test_required_subtitle_is_bound_to_literal_script_without_guessing(self):
         row=required_subtitle({"description":"角色转身，画面切黑，字幕浮现：当晚她删掉歌单。"})
         self.assertEqual(row["expected_text"],"当晚她删掉歌单。")

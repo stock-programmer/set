@@ -158,7 +158,7 @@ class StudioJobTests(unittest.TestCase):
             data = self.run_job("studio_video", self.pid,
                                 {"plan_id": plan["plan_id"], "project_sha256": plan["project_sha256"]}, timeout=90)
             self.assertEqual(data["status"], "succeeded", data["error"])
-            self.assertEqual(worker.call_args.kwargs["max_video_generations"], 36)
+            self.assertEqual(worker.call_args.kwargs["max_video_generations"], 24)
             view = studio_project_for_video(self.service, self.pid)
             store = CollabStore(view["store_path"])
             receipt = store.messages(view["run_id"], message_type="production.requested")[0]["payload"]

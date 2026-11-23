@@ -12,6 +12,7 @@ from pathlib import Path
 
 from pianchang.agent_loop import Tool, _validate
 from pianchang.story_spec import digest_json
+from pianchang.video_repair import failed_retake_issues, retake_limit
 from trace_system import TraceError, event, get_tracer, traced
 
 VERSION = "video-autonomy/1"
@@ -22,6 +23,201 @@ def _strategy_context(result):
     return {**{k:result[k] for k in ("repair_id","shot_id","candidate_sha256","report_sha256","criterion_ids","next_action") if k in result},
             "strategy":{k:result["strategy_design"][k] for k in ("strategy_family","change_from_previous")},
             "full_plan_sha256":digest_json(result)}
+
+
+def all_reused_continuation(plan):
+    plan = plan or {}
+    return bool(plan.get("continuation") and plan.get("reuse_shots")
+                and plan.get("new_shots") == [] and plan.get("retake_shots") == []
+                and not plan.get("repair_existing_only") and not plan.get("deferred_shots"))
+
+
+@traced("video.autonomy.can_prepare_reused_continuation", kind="validation", capture_inputs=False)
+def can_prepare_reused_continuation(directory, plan, record):
+    """Recognize an untouched Pi workspace, including interrupted local preparation."""
+    if (not all_reused_continuation(plan) or record.get("shooting_plan") != plan
+            or record.get("video_generations") != 0 or record.get("external_model_calls", 0) != 0
+            or record.get("reserved_shots") != [] or record.get("repair_reservations") != {}
+            or record.get("messages") != [] or record.get("pending_tool") or record.get("reconciled_operations")):
+        return False
+    directory = Path(directory)
+    local_preparation = {"agent", "autonomy.json", "project.json", "impact.json", "clips.json", "reports.json"}
+    # Unknown pending work, a repair record or a review request must follow original recovery.
+    if any(p.name not in local_preparation and not (p.name.startswith(".w-") and p.suffix == ".tmp")
+           for p in directory.iterdir()):
+        return False
+    journal = directory / "autonomy.json"
+    state = json.loads(journal.read_text("utf-8")) if journal.is_file() else {}
+    return not any(state.get(key) for key in ("provider_blockers", "coordination", "coordination_errors",
+                                              "candidate_selection", "review_attempts", "specification_blockers",
+                                              "video_generations", "repair_reservations"))
+
+
+def _pi_order_before_generation(plan, record):
+    if not isinstance(record, dict) or not isinstance(plan, dict):
+        return False
+    limits = record.get("limits")
+    policy = plan.get("acceptance_loop")
+    if not isinstance(limits, dict) or not isinstance(policy, dict):
+        return False
+    steps, maximum = record.get("steps"), limits.get("max_steps")
+    return (record.get("backend") == "pi" and policy.get("autonomy_version") == VERSION
+            and record.get("shooting_plan") == plan
+            and type(steps) is int and type(maximum) is int and 0 < steps < maximum
+            and type(record.get("video_generations")) is int and record["video_generations"] == 0
+            and type(record.get("external_model_calls")) is int and record["external_model_calls"] == 0
+            and record.get("reserved_shots") == [] and record.get("repair_reservations") == {}
+            and not record.get("pending_tool") and not record.get("reconciled_operations"))
+
+
+def _can_resume_unprepared_pi_order(directory, plan, record):
+    """Recognize the untouched workspace before the first planning tool."""
+    if not _pi_order_before_generation(plan, record) or record.get("messages") != []:
+        return False
+    directory = Path(directory)
+    try:
+        # Even a partial local plan or an unknown file follows normal recovery.
+        if any(path.name not in {"agent", "autonomy.json"} for path in directory.iterdir()):
+            return False
+        journal = directory / "autonomy.json"
+        state = json.loads(journal.read_text("utf-8")) if journal.is_file() else {}
+    except (OSError, ValueError):
+        return False
+    return isinstance(state, dict) and not any(state.get(key) for key in (
+        "provider_blockers", "coordination", "coordination_errors", "candidate_selection",
+        "review_attempts", "specification_blockers", "video_generations", "repair_reservations",
+        "actionable", "blocked", "exhausted"))
+
+
+def can_resume_planned_pi_order(directory, plan, record):
+    """Verify a completed local plan with no reservations or generation side effects."""
+    if not _pi_order_before_generation(plan, record):
+        return False
+    messages = record.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return False
+    directory = Path(directory)
+    try:
+        if {p.name for p in directory.iterdir()} != {"agent", "autonomy.json", "project.json", "impact.json"}:
+            return False
+        project = json.loads((directory / "project.json").read_bytes())
+        impact = json.loads((directory / "impact.json").read_bytes())
+        state = json.loads((directory / "autonomy.json").read_bytes())
+        if (not isinstance(impact, dict) or not impact.get("shots") or not isinstance(state, dict)
+                or digest_json(project) != plan.get("project_sha256")
+                or any(state.get(k) for k in ("provider_blockers","coordination","coordination_errors",
+                    "candidate_selection","review_attempts","specification_blockers","video_generations",
+                    "repair_reservations","blocked","exhausted"))):
+            return False
+        # Pi journals tool results after success. Repeating this local tool returns the same impact.
+        expected = {"type":"tool_result", "tool":"plan_production", "ok":True, "result":impact}
+        return all(isinstance(row,dict) and row.get("role") == "user"
+                   and json.loads(row.get("content","")) == expected for row in messages)
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def can_resume_paid_pi_order(work, plan, record, proof, *, request_id, run_id, script, output, limits):
+    """Resume a stopped planner only with its original session, budget and verified paid clips."""
+    from pianchang.studio_live_progress import confirmed_video_reservations
+    from pianchang.reference_inputs import external_review_usage
+    from pi_bridge.recovery import strategy_external_usage
+
+    work = Path(work)
+    context = record.get("trace_context") or {}
+    result = record.get("result") or {}
+    try:
+        steps, used = record["steps"], record["video_generations"]
+        external = record["external_model_calls"]
+        if (record.get("backend") != "pi" or record.get("status") != "needs_input"
+                or result.get("reason") != "pi_stopped" or result.get("task_complete") is not False
+                or record.get("shooting_plan") != plan or plan["acceptance_loop"]["autonomy_version"] != VERSION
+                or plan.get("execution_limits") != limits or not isinstance(limits, dict)
+                or record["limits"]["max_video_generations"] != limits["max_video_generations"]
+                or record["limits"]["max_steps"] != limits["max_model_calls"]
+                or any(type(n) is not int for n in (steps, used, external, limits["max_video_generations"], limits["max_model_calls"]))
+                or not (0 < used <= limits["max_video_generations"] and steps > 0 and external >= 0
+                        and steps + external < limits["max_model_calls"])
+                or (result.get("steps"), result.get("video_generations")) != (steps, used)
+                or record.get("pending_tool") or record.get("trace_incomplete")
+                or record.get("process_cleanup", {}).get("confirmed_exit") is not True
+                or proof.get("request_kind") != "model" or proof.get("dispatch") != "not_sent"
+                or (proof.get("commission_id"), proof.get("run_id")) != (request_id, run_id)
+                or (proof.get("trace_id"), proof.get("run_span_id")) != (context["trace_id"], context["span_id"])
+                or proof.get("stopped_steps") != steps or not proof.get("pi_session_id")
+                or proof["pi_session_id"] != record.get("session_id")
+                or proof.get("session_file_digest") != digest_json(record["session_file"])):
+            return False
+        with Path(record["session_file"]).open(encoding="utf-8") as session:
+            header = json.loads(session.readline())
+        state = json.loads((work / "autonomy.json").read_bytes())
+        project = json.loads((work / "project.json").read_bytes())
+        impact = json.loads((work / "impact.json").read_bytes())
+        if (header.get("type") != "session" or header.get("id") != record["session_id"]
+                or digest_json(project) != plan["project_sha256"] or not impact.get("shots")
+                or state.get("provider_blockers") != {}
+                or state.get("coordination_errors") or strategy_external_usage(work)
+                or len(external_review_usage(work / "reference-inputs")["reservations"]) != external
+                or stopped_retake_summary(work, record)):
+            return False
+
+        history_path = work / "repair-history.json"
+        history = json.loads(history_path.read_bytes())["history"] if history_path.exists() else []
+        if any(row.get("status") == "started_or_unknown" for row in history):
+            return False
+        repairs = {(row["shot_id"], row["repair_id"]): row["result_clip"] for row in history if row.get("result_clip")}
+        selected = json.loads((work / "clips.json").read_bytes())
+        paid_clips = {}
+        for message in record["messages"]:
+            tool = json.loads(message["content"])
+            if message.get("role") != "user" or tool.get("type") != "tool_result" or tool.get("ok") is not True:
+                return False
+            name = tool.get("tool")
+            if name == "plan_production" and tool["result"] != impact:
+                return False
+            if name not in {"generate_shot", "regenerate_shot"}:
+                continue
+            outcome = tool["result"]
+            sid = outcome["shot_id"]
+            repair_id = outcome["repair_id"] if name == "regenerate_shot" else None
+            clip = repairs[(sid, repair_id)] if repair_id else outcome
+            key = digest_json({"order":str(work), "shot_id":sid, "repair_id":repair_id})
+            if key in paid_clips or sid not in selected:
+                return False
+            paid_clips[key] = clip
+        # A crash before the tool response was journaled can leave a later GET-based
+        # recovery receipt instead. Require its original operation and the exact task.
+        for recovery in record.get("reconciled_operations", []):
+            operation, observation = recovery["operation"], recovery["observation"]
+            outcomes = observation.get("outcomes", [])
+            if (operation.get("effect") != "video" or operation.get("tool") not in {"generate_shot", "regenerate_shot"}
+                    or observation.get("budget_preserved") is not True or observation.get("new_video_posts") != 0
+                    or observation.get("blocked_shots") != {} or len(outcomes) != 1):
+                return False
+            sid = operation["arguments"]["shot_id"]
+            repair_id = operation["arguments"]["repair_id"] if operation["tool"] == "regenerate_shot" else None
+            if repair_id:
+                clip = repairs[(sid, repair_id)]
+            else:
+                originals = [selected[sid], *(h["source_clip"] for h in history if h.get("source_clip") and h["shot_id"] == sid)]
+                clip = next((c for c in originals if c.get("task_id") == outcomes[0].get("task_id")), None)
+            key = digest_json({"order":str(work), "shot_id":sid, "repair_id":repair_id})
+            if (not clip or key in paid_clips or outcomes[0].get("shot_id") != sid or outcomes[0].get("task_id") != clip["task_id"]
+                    or outcomes[0].get("status") != "recovered_and_reviewed" or outcomes[0].get("new_video_posts") != 0):
+                return False
+            paid_clips[key] = clip
+        # A discarded retake may leave the original selected. The selected bytes and every
+        # paid candidate must survive independently before Pi inherits its reservation ledger.
+        from pianchang.video_collab_agent import _validated_media
+        paid_tasks = {(clip["shot_id"], clip["task_id"]) for clip in paid_clips.values()}
+        for sid, clip in selected.items():
+            if (sid != clip.get("shot_id") or clip.get("script_ref") != script
+                    or sid in record["reserved_shots"] and (sid, clip.get("task_id")) not in paid_tasks):
+                return False
+            _validated_media(clip, require_origin=True)
+        return confirmed_video_reservations(output, work, plan, script, record, paid_clips=paid_clips)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return False
 
 
 @traced("video.autonomy.recoverable_coordination",kind="validation",capture_inputs=False)
@@ -48,10 +244,46 @@ def recoverable_order(directory):
         return _recoverable_order(directory)
 
 
+def stopped_retake_summary(directory, run):
+    """Read the final decision, including old commissions stopped under a higher cap."""
+    result = run.get("result") or {}
+    if result.get("reason") == "acceptance_retake_limit":
+        return result["summary"]
+    if run.get("status") not in {"needs_input", "budget_exhausted"} or run.get("pending_tool"):
+        return None
+    reservations = {sid for sid, count in run.get("repair_reservations", {}).items() if count}
+    state_path = Path(directory) / "autonomy.json"
+    history_path = Path(directory) / "repair-history.json"
+    if not reservations or not state_path.is_file() or not history_path.is_file():
+        return None
+    state = json.loads(state_path.read_bytes())
+    if state.get("provider_blockers") or "actionable" not in state:
+        return None
+    history = json.loads(history_path.read_bytes()).get("history", ())
+    reviewed = {h["shot_id"] for h in history if h.get("strategy") == "prompt_and_locked_references"
+                and h.get("result_report") and h.get("result_clip")}
+    exhausted = reviewed & reservations
+    if any(r["shot_id"] not in exhausted or r.get("next_action") in {"generate_shot", "reuse_shot", "resume_pending_generation"}
+           for r in state["actionable"]):
+        return None
+    issues = [r for key in ("actionable", "exhausted", "blocked") for r in state.get(key, ())
+              if r["shot_id"] in exhausted and r.get("reason")]
+    if issues:
+        lines = ["自动重拍额度已用完，当前验收未通过。"]
+        for sid in dict.fromkeys(r["shot_id"] for r in issues):
+            latest = next(h for h in reversed(history) if h["shot_id"] == sid and h.get("result_report")
+                          and h.get("strategy") == "prompt_and_locked_references" and h.get("result_clip"))
+            failed = failed_retake_issues(latest) or [r for r in issues if r["shot_id"] == sid]
+            lines.extend(f'{sid} · {r["criterion_id"]} [{r["status"]}] {r["reason"]}' for r in failed)
+        return "\n".join(lines)
+
+
 def _recoverable_order(directory):
     path=Path(directory)/"agent/run.json"
     if not path.is_file():return False
     run=json.loads(path.read_text("utf-8"))
+    if stopped_retake_summary(directory, run):
+        return False
     missing_evaluation=False
     selection_regression=False
     missing_subtitle=False
@@ -177,6 +409,8 @@ def enqueue_recovery(service,*,recover_trace_failures=False):
         with sessions.lock if sessions else nullcontext(),service.lock:
             live=next((j for j in service.state["jobs"] if j["id"]==snapshot["id"]),None)
             if not live or not eligible(live) or current_ids(service.state["jobs"]).get(live["project_id"])!=live["id"]:continue
+            if any(j.get("kind") == "studio_review" and j.get("project_id") == live["project_id"]
+                   and j["status"] in {"queued","running"} for j in service.state["jobs"]):continue
             if any(live.get(k)!=snapshot.get(k) for k in ("trace_id","message_id","run_id")):continue
             if conversation:
                 active_id=sessions.repo.get(conversation["id"])["active_job"]
@@ -216,6 +450,7 @@ class VideoAutonomy:
         self.review_attempts = {}
         self.specification_blockers = {}
         self.selection_recoveries = []
+        self.defer_new_clarifications_once = False
         self.tools = [Tool("design_repair_strategy",
             "根据当前实际失败证据和所有历史方案设计不同的拍摄策略，并绑定当前候选准备修复。不能重复失败提示或放宽条件。",
             {"type":"object","properties":{"shot_id":{"type":"string","minLength":1,"maxLength":128}},
@@ -255,7 +490,8 @@ class VideoAutonomy:
                 row["blocker_kind"] = "outside_authorized_scope"; blockers.append(row)
             elif sid in self.blocked:
                 operation=self.blocked[sid]
-                row.update(blocker_kind="unconfirmed_operation", operation=operation)
+                row.update(blocker_kind="submission_rejected" if operation.get("kind") == "submission_rejected"
+                           else "unconfirmed_operation", operation=operation)
                 if operation.get("task_id") and operation.get("manifest_path") and not operation.get("terminal_failure"):
                     row["next_action"]="resume_pending_generation";actionable.append(row)
                 else:blockers.append(row)
@@ -276,13 +512,12 @@ class VideoAutonomy:
                     actionable.append(row)
                 else:
                     row["blocker_kind"]="authorized_repair_limit";exhausted.append(row)
+            elif issue.get("needs_creative_audio") and self.review_attempts.get(sid, 0) < 2:
+                row["next_action"] = "review_existing_shot"; actionable.append(row)
+            elif reservations.get(sid, 0) >= retake_limit(policy, sid) or w.repair.retake_spent(sid):
+                row["blocker_kind"] = "authorized_repair_limit"; exhausted.append(row)
             elif issue["status"]=="UNKNOWN" and "未执行" in issue.get("reason",""):
                 row["next_action"]="review_existing_shot";actionable.append(row)
-            elif issue["criterion_id"]=="script_subtitle" and issue["status"]=="FAIL":
-                if w.repair.local_edits.get(sid,0)<policy.get("max_local_edits_per_shot",2):
-                    row["next_action"]="prepare_shot_repair";row["repair_method"]="edit_shot_asset";actionable.append(row)
-                else:
-                    row["blocker_kind"]="local_edit_limit";exhausted.append(row)
             elif issue["status"] == "UNKNOWN":
                 row["blocker_kind"] = "insufficient_evidence"; blockers.append(row)
             elif issue["criterion_id"] in {"evidence_integrity","candidate_binding","reference_submission","acceptance_binding","required_coverage"}:
@@ -291,7 +526,7 @@ class VideoAutonomy:
                 row["blocker_kind"]="evidenced_specification_conflict"
                 row["field_evidence"]=[v for v in self.specification_blockers.values() if v["shot_id"]==sid]
                 blockers.append(row)
-            elif remaining <= 0 or reservations.get(sid, 0) >= policy.get("max_repairs_per_shot", 2):
+            elif remaining <= 0:
                 row["blocker_kind"] = "authorized_repair_limit"; exhausted.append(row)
             else:
                 # Regression reports can include a downstream edge. Repair one of its actual sources.
@@ -304,6 +539,20 @@ class VideoAutonomy:
                   "remaining_video_generations":remaining,
                   "next_action":(actionable[0].get("next_action") or "design_repair_strategy") if actionable else "coordinate_agents_or_report_evidenced_blockers",
                   "all_required_passed":not issues}
+        if not actionable and exhausted:
+            summaries = []
+            for sid in dict.fromkeys(row["shot_id"] for row in exhausted):
+                if not (reservations.get(sid, 0) or w.repair.retake_spent(sid)):
+                    continue
+                failure = next((h["retake_failure"] for h in reversed(w.repair.history)
+                                if h["shot_id"] == sid and h.get("retake_failure")), None)
+                if failure:
+                    summaries.append(failure["summary"])
+                else:
+                    lines = [f'{r["criterion_id"]} [{r["status"]}] {r["reason"]}' for r in exhausted if r["shot_id"] == sid]
+                    summaries.append(f"{sid} 自动重拍额度已用完，当前验收未通过。\n" + "\n".join(lines))
+            if summaries:
+                result["terminal_summary"] = "\n".join(summaries)
         event("video.autonomy.work_partition", result, kind="validation")
         return result
 
@@ -351,21 +600,25 @@ class VideoAutonomy:
     def tick(self, record):
         from pianchang.video_collab_agent import _write
         from pianchang.video_repair import verified_selection_plan
+        # Loading the first decision prompt must not turn reused reports into new script-agent work.
+        defer_new_clarifications = self.defer_new_clarifications_once
+        self.defer_new_clarifications_once = False
         if self.blocked:self.observe_pending(wait=False)
         if getattr(self.w,"project",None) and getattr(self.w,"repair",None):
             selection=verified_selection_plan(self.w.project,self.w.shots,self.w.reports,self.w.repair.history)
             if selection["changes"]:
                 self.selection_recoveries.extend(self.w.repair.recover_best_candidates())
-        try:
-            if self.negotiation and self.w.project:
-                self.request_clarifications()
-            self.coordinate()
-        except TraceError:raise
-        except Exception as exc:
-            key="coordination"
-            self.coordination_errors[key]={"reason":str(exc),"attempts":self.coordination_errors.get(key,{}).get("attempts",0)+1}
-            event("video.autonomy.coordination_blocked",self.coordination_errors[key],kind="error")
         result = self.queue(record)
+        if self.negotiation and not result.get("terminal_summary"):
+            try:
+                if self.w.project and not defer_new_clarifications:
+                    self.request_clarifications()
+                self.coordinate()
+            except TraceError:raise
+            except Exception as exc:
+                key="coordination"
+                self.coordination_errors[key]={"reason":str(exc),"attempts":self.coordination_errors.get(key,{}).get("attempts",0)+1}
+                event("video.autonomy.coordination_blocked",self.coordination_errors[key],kind="error")
         # Keep rich evidence on disk; send only the actionable ids and concise blockers to the planner.
         _write(self.w.directory / "autonomy.json", {**result,"provider_blockers":self.blocked,
                 "coordination":self.coordination,"coordination_errors":self.coordination_errors,
@@ -373,7 +626,9 @@ class VideoAutonomy:
                 "specification_blockers":self.specification_blockers,
                 "candidate_selection":self.selection_recoveries,
                 "video_generations":record["video_generations"],"repair_reservations":record.get("repair_reservations",{})})
-        return {**{k:result[k] for k in ["remaining_video_generations","next_action","all_required_passed"]},
+        return {**{k:result[k] for k in ["remaining_video_generations","next_action","all_required_passed","terminal_summary"] if k in result},
+                "submission_rejections":{sid:{"reason":b["reason"], "references":b["references"]}
+                    for sid,b in self.blocked.items() if b.get("kind") == "submission_rejected"},
                 **{k:[{f:r.get(f) for f in ["shot_id","criterion_id","status","blocker_kind","next_action","repair_method"]} for r in result[k]]
                    for k in ["actionable","blocked","exhausted"]},
                 "coordination":self.coordination[-2:],
@@ -422,6 +677,12 @@ class VideoAutonomy:
 
     @traced("video.autonomy.review_existing", kind="tool", capture_inputs=False)
     def review_existing(self, shot_id):
+        if shot_id in self.w.reports and self.w.repair.retake_spent(shot_id):
+            from pianchang.creative_sound import legacy_audio_checks
+            from pianchang.video_collab_agent import _read
+            shot = next(s for s in self.w.project["shots"] if s["id"] == shot_id)
+            if not legacy_audio_checks(shot, _read(self.w.reports[shot_id]["report_path"])):
+                raise ValueError("本镜头已完成重拍验收，等待人工审看。")
         if self.review_attempts.get(shot_id,0)>=2:
             raise ValueError("已两次实际尝试恢复该项检查，执行错误和收据已保留；继续其他镜头。")
         self.review_attempts[shot_id]=self.review_attempts.get(shot_id,0)+1
@@ -442,6 +703,8 @@ class VideoAutonomy:
         existing=n.store.messages(causation_id=n.production_message_id,message_type="script.revision_requested")
         beats={r["payload"]["beat_id"] for r in existing}
         for sid,summary in self.w.reports.items():
+            if self.w.repair.retake_spent(sid):
+                continue
             report=_read(summary["report_path"])
             row=next((r for r in report["results"] if r["criterion_id"]=="start_end_state" and r["status"]!="PASS"),None)
             if not row or not row.get("state_checks"):continue
@@ -527,7 +790,10 @@ class VideoAutonomy:
     def design(self, shot_id):
         from pianchang.video_collab_agent import _write, _read
         w = self.w
+        w.repair.require_retake_available(shot_id)
         if shot_id in self.blocked:
+            if self.blocked[shot_id].get("kind") == "submission_rejected":
+                raise ValueError(self.blocked[shot_id]["reason"])
             raise ValueError("该镜头已有未确认的提交，不能设计再次付费生成。")
         report = w.repair.read(shot_id)
         rows = [r for r in report["issues"] if r["status"] == "FAIL" and
@@ -592,11 +858,49 @@ class VideoAutonomy:
         path=self.w.directory/"strategy-recovery.json"
         return list(json.loads(path.read_text("utf-8"))["operations"].values()) if path.exists() else []
 
+    def _record_rejection(self, sid, pending, key, path, job):
+        from pianchang.video_agent import bound_submission_rejection
+        if job.get("status") != "SUBMISSION_REJECTED" or pending.get("effect") != "video":
+            return None
+        args = pending.get("arguments") or {}
+        meta = job.get("metadata") or {}
+        repair_id = args.get("repair_id")
+        repair = self.w.repair.plans.get(repair_id)
+        if args.get("shot_id") != sid or (repair_id and not repair) or meta.get("execution_key") != key:
+            return None
+        evidence = bound_submission_rejection(job, path, directory=self.w.directory, shot_id=sid,
+            repair_id=repair_id, script_ref=self.w.ref, dependency_sha256=self.w.impact["shots"][sid]["target"]["sha256"])
+        if evidence is None:
+            return None
+        self.blocked[sid] = evidence
+        for history in self.w.repair.history:
+            if history["repair_id"] == repair_id:
+                if history.get("status") == "blocked_unconfirmed_submission":
+                    history["previous_reconciliation"] = {"status":history["status"], "evidence":history.get("evidence")}
+                history.update(status="submission_rejected", evidence=evidence)
+        event("video.autonomy.confirmed_submission_rejection", evidence, kind="state")
+        return {"shot_id":sid, "status":"submission_rejected", "new_video_posts":0, "evidence":evidence}
+
     @traced("video.autonomy.recover", kind="task", capture_inputs=False)
     def recover(self, record):
         from pianchang.video_collab_agent import _read, _write, _validated_media
         from pianchang.video_agent import VideoRunner
         w = self.w
+        # A first Pi decision can fail before plan_production has ever created its files.
+        # Only repeat deterministic preparation. Any tool or paid reservation follows
+        # normal operation reconciliation below, preserving repaired candidates.
+        if (getattr(w, "reuses_entire_continuation", False)
+                and can_prepare_reused_continuation(w.directory, w.shooting_plan, record)):
+            return {**w.prepare_reused_clips(), "budget_preserved": True}
+        # Pi has preserved the old outcome and budget before invoking recovery.
+        # A failed initial decision has no project to load yet; the next decision
+        # must still call plan_production against the original frozen inputs.
+        if ((record.get("previous_result") or {}).get("reason") == "pi_stopped"
+                and _can_resume_unprepared_pi_order(w.directory, w.shooting_plan, record)):
+            result = {"preparation_pending": True, "next_action": "plan_production",
+                      "new_video_posts": 0, "budget_preserved": True}
+            event("video.autonomy.resume_unprepared_order", result, kind="state")
+            return result
         # Restore only the current immutable order, never infer media from another commission.
         saved_project = _read(w.directory / "project.json")
         if saved_project != w.template or digest_json(saved_project.get("script_source",{}).get("script")) != digest_json(w.script):
@@ -634,6 +938,16 @@ class VideoAutonomy:
                     break
         args=pending.get("arguments",{});sid=args.get("shot_id")
         outcomes=[]
+        # Older runs kept the manifest but described an HTTP rejection as unknown.
+        for old_sid, blocker in list(self.blocked.items()):
+            paths = blocker.get("manifest_paths") or []
+            if old_sid == sid or len(paths) != 1 or not blocker.get("pending_tool") or not blocker.get("execution_key"):
+                continue
+            path = Path(paths[0]).resolve()
+            if path.name == "job.json" and path.parent.parent == Path(w.video_config.output_dir).resolve() and path.is_file():
+                result = self._record_rejection(old_sid, blocker["pending_tool"], blocker["execution_key"], path, _read(path))
+                if result:
+                    outcomes.append(result)
         if pending.get("effect")=="video" and sid:
             repair=w.repair.plans.get(args.get("repair_id"))
             key=w.operation_key(sid,repair)
@@ -644,6 +958,7 @@ class VideoAutonomy:
             from pianchang.video_agent import verified_local_failure
             not_sent = [path for path,j in matches if verified_local_failure(j, path)]
             matches = [(path,j) for path,j in matches if path not in not_sent]
+            rejected = self._record_rejection(sid, pending, key, *matches[0]) if len(matches) == 1 else None
             if not matches and not_sent:
                 self.blocked.pop(sid,None)
                 for history in w.repair.history:
@@ -651,6 +966,8 @@ class VideoAutonomy:
                         history.update(status="local_failure_before_post",manifest_paths=[str(path) for path in not_sent])
                 outcomes.append({"shot_id":sid,"status":"local_failure_before_post","new_video_posts":0,
                                  "manifest_paths":[str(path) for path in not_sent]})
+            elif rejected:
+                outcomes.append(rejected)
             elif len(matches)!=1 or not matches[0][1].get("task_id"):
                 self.blocked[sid]={"reason":"已有视频操作缺少唯一可核对的provider task_id；禁止重复POST。",
                     "execution_key":key,"manifest_paths":[str(p) for p,j in matches],"pending_tool":pending}

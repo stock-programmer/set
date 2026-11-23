@@ -136,6 +136,12 @@ def configured_text_routes(config):
     return None
 
 
+def require_native_text_provider(config):
+    routes = configured_text_routes(config)
+    if routes is not None:
+        routes.require_provider("aliyun-bailian")
+
+
 def text_client_for(client, purpose):
     """Route production helpers while leaving explicitly injected clients untouched."""
     if not isinstance(client, BailianTextClient):
@@ -154,6 +160,13 @@ def routed_cache_identity(client):
             and route.model_id == client.base_config.model):
         return None
     return route.snapshot()
+
+
+def completion_budget(route, max_tokens):
+    """Use OpenAI's completion budget, which includes reasoning and visible output."""
+    if route is not None and route.provider == "openai" and route.sdk_provider == "openai":
+        return {"max_completion_tokens": max_tokens}
+    return {"max_tokens": max_tokens}
 
 
 def _messages(messages):
@@ -230,14 +243,17 @@ class BailianTextClient:
         details = body.get("error")
         details = details if isinstance(details, dict) else body
         code = details.get("code") or details.get("type") or "APIError"
-        provider = self.route.provider if self.route is not None else "百炼"
-        message = details.get("message") or "文本 API 请求失败"
-        return self._failure(f"{provider} 文本 API 错误：{code}: {message}", body=body, code=code,
+        provider = self.route.provider if self.route is not None else (
+            "OpenAI" if getattr(self.config, "adapter", "") == "openai" else "百炼")
+        message = details.get("message") or "模型 API 请求失败"
+        return self._failure(f"{provider} 模型 API 错误：{code}: {message}", body=body, code=code,
                              http_status=http_status, request_id=request_id)
 
     @traced("bailian.text.complete_json", kind="model")
     def complete_json(self, messages):
         messages = _messages(messages)
+        if self.route is None:
+            require_native_text_provider(self.base_config)
         key = self.config.api_key
         if not key or key.lower() in ("your_api_key", "your-api-key", "sk-xxxx", "replace_me"):
             if self.route is None:
@@ -248,7 +264,7 @@ class BailianTextClient:
             try:
                 body = call_sdk(self.route, "completion", messages=messages,
                                 response_format={"type": "json_object"}, stream=False,
-                                max_tokens=self.config.max_tokens, timeout=self.config.request_timeout)
+                                timeout=self.config.request_timeout, **completion_budget(self.route, self.config.max_tokens))
             except TraceError:
                 raise
             except Exception as exc:

@@ -123,6 +123,15 @@ def create_contract(project, shot_id, *, width=720, height=1280):
         criterion("action_sequence", "continuous_video", "连续画面确实表现镜头动作，不能仅凭首尾推断：" + shot["description"]),
         criterion("start_end_state", "continuous_video", "实际开始与结束状态符合预期，且能确认相关角色与道具"),
     ]
+    members = shot.get("creative_shots", [])
+    for member in members:
+        requirements.append(criterion("creative:" + member["id"], "creative_shot",
+            "定位该分镜实际开始和结束的时段，核对动作、角色、服装道具和起止状态：" +
+            json.dumps({k: member[k] for k in ("description","requires","expected_after")}, ensure_ascii=False)))
+    for left, right in zip(members, members[1:]):
+        requirements.append(criterion("internal:" + left["id"] + "->" + right["id"], "internal_cut",
+            "检查同一生成片段中相邻分镜的真实切换、人物、道具、空间、动作和声音。",
+            creative_pair=[left["id"], right["id"]]))
     subtitle=required_subtitle(shot)
     if subtitle:requirements.append(subtitle)
     if shot.get("required_refs"):
@@ -409,6 +418,15 @@ def run_checks(project, contract, inspection, observations=None, *, job=None, re
                     result["evidence"] = [{"width": metadata["width"], "height": metadata["height"]}]
         elif cid in content_results:
             result.update(content_results[cid])
+        elif kind == "internal_cut" and content_evidence is not None:
+            from pianchang.content_review import internal_cut_windows
+            left, right = requirement["creative_pair"]
+            if internal_cut_windows((left, right), content_results.values()):
+                result.update(execution_status="not_run",
+                              reason=f"已定位 {left}、{right} 的实际时间区间，这份报告尚未执行片内切点观察。")
+            else:
+                result.update(execution_status="blocked_missing_cut_window",
+                              reason=f"原片深度审看未取得 {left}、{right} 两侧有序且互不重叠的有效时间区间，暂无法定位片内切点。")
         elif kind == "sampled_visual":
             items = candidates.get(cid, [])
             if malformed_observations or len(items) != 1:
@@ -430,6 +448,8 @@ def run_checks(project, contract, inspection, observations=None, *, job=None, re
                 "reference_comparison": "尚无已批准角色参考及校准后的身份比较证据；文字外貌相似不等于同一角色。",
                 "reference_and_camera": "缺少场景参考与机位验证，静帧不能确认世界坐标布局。",
                 "continuous_video": "稀疏帧不能证明连续动作或完整起止过程，需要连续片段观察。",
+                "creative_shot": "待结合原片时间区间逐项核对剧本中的镜头内容。",
+                "internal_cut": "待定位相邻镜头的实际时间区间，检查切点两侧画面和声音。",
                 "sequence_review": "尚无绑定前后镜头候选的组合预览与衔接审看证据。",
                 "audio_content": "尚无真实音轨转写、说话人和时序证据。",
                 "on_screen_text": "待检查实际视频中的字幕并逐字比较剧本原文，尚未取得文字观察。",

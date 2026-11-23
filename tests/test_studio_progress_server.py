@@ -25,6 +25,7 @@ class ProgressHTTPTests(unittest.TestCase):
         (root / "state.json").write_text(json.dumps({"jobs":[{"id":self.job_id, "kind":"studio_video",
             "project_id":"p", "status":"running"}]}), encoding="utf-8")
         self.server = create_server(self.source, port=0, progress_only=True)
+        self.server.daemon_threads = False
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
         self.addCleanup(self.stop)

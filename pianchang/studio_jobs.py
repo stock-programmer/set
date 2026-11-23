@@ -7,7 +7,7 @@ from pathlib import Path
 
 from pianchang.app_service import project_id_for_path, read_json, story_constraints, write_json
 from pianchang.bailian_text import BailianTextClient
-from pianchang.collaboration_workflow import Collaboration, dep, open_ref, ref
+from pianchang.collaboration_workflow import Collaboration, VideoAgentStopped, dep, open_ref, ref
 from pianchang.script_collab_agent import ScriptWorkspace, publish_script_revision, run_script_agent
 from pianchang.story_agent import StoryRunner
 from pianchang.story_spec import digest_json, validate_compilation, validate_script, validate_structure_constraints
@@ -31,7 +31,8 @@ def _checked(path, expected, actual):
 def validate_submission(action, body):
     if action == "studio_review":
         pointer = body.get("continuation")
-        if (set(body) != {"continuation"} or not isinstance(pointer, dict)
+        if (set(body) not in ({"continuation"},{"continuation","retry_observation"}) or not isinstance(pointer, dict)
+                or "retry_observation" in body and not re.fullmatch(r"[a-f0-9]{64}",str(body["retry_observation"]))
                 or set(pointer) != {"request_id", "sha256"}
                 or not re.fullmatch(r"[a-f0-9]{32}", str(pointer.get("request_id")))
                 or not re.fullmatch(r"[a-f0-9]{64}", str(pointer.get("sha256")))):
@@ -241,14 +242,29 @@ def studio_video_plan(view, previous, *, incomplete_snapshot=...):
         plan["retake_shots"] = [sid for sid in plan["retake_shots"] if sid not in ready]
         plan["reuse_shots"] = [s["id"] for s in project["shots"] if s["id"] in ready or s["id"] in plan["reuse_shots"]]
         plan["continuation"] = {"request_id": incomplete["request_id"], "sha256": incomplete["sha256"]}
+        if incomplete.get("retake_stop"):
+            plan["blocked_reason"] = incomplete["retake_stop"]
         unresolved = incomplete["unknown_shots"] + incomplete["failed_shots"]
         if unresolved:
             plan["unresolved_shots"] = unresolved
             plan["blocked_reason"] = "以下已有任务的结果或重拍授权仍需处理，暂不重复生成：" + "、".join(unresolved)
-    from pianchang.video_repair import acceptance_policy
-    plan["acceptance_loop"] = acceptance_policy([s["id"] for s in project["shots"]])
+    from pianchang.video_repair import acceptance_policy, authorized_video_count
+    retried = set((incomplete or {}).get("previously_retried_shots", ()))
+    if previous:
+        retried.update(h["shot_id"] for h in previous["content"].get("repair_history", ())
+                       if h.get("strategy") == "prompt_and_locked_references"
+                       and h.get("status") != "local_failure_before_post" and h["shot_id"] in plan["reuse_shots"])
+    cap = project.get("generation_request_limit")
+    initial = len(plan["new_shots"]) + len(plan["retake_shots"])
+    plan["acceptance_loop"] = acceptance_policy([s["id"] for s in project["shots"]],
+        repairs_per_shot=0 if cap is not None and initial == cap else 1, previously_retried_shots=retried)
     from pianchang.video_execution import execution_limits
-    budget=len(plan["new_shots"])+len(plan["retake_shots"])+len(plan["acceptance_loop"]["shot_ids"])*plan["acceptance_loop"]["max_repairs_per_shot"]
+    if "generation_request_limit" in project:
+        plan["generation_request_limit"] = project["generation_request_limit"]
+        plan["generation_tasks"] = [{"id": s["id"], "duration_s": s["duration_s"],
+            "creative_shots": [member["id"] for member in s["creative_shots"]],
+            "required_refs": s.get("required_refs", [])} for s in project["shots"]]
+    budget = authorized_video_count(plan)
     plan["execution_limits"]=execution_limits(plan,budget,len(project["shots"]))
     plan["plan_id"] = digest_json(plan)
     # Content failures are handled inside the same production agent loop.
@@ -259,6 +275,7 @@ def studio_video_plan(view, previous, *, incomplete_snapshot=...):
 
 
 def _approved_plan(view, previous, body):
+    from pianchang.video_repair import acceptance_policy, authorized_video_count
     plan = studio_video_plan(view, previous)
     _checked("拍摄计划已更新", plan["plan_id"], body["plan_id"])
     if plan.get("blocked_reason"):
@@ -267,12 +284,12 @@ def _approved_plan(view, previous, body):
     if body.get("repair_existing_only"):
         if not plan.get("continuation") or not plan["reuse_shots"] or proposal:
             raise ValueError("当前没有可独立恢复的已有候选，或原生成结果仍需核实。")
-        from pianchang.video_repair import acceptance_policy
         plan.update(repair_existing_only=True, deferred_shots=plan["new_shots"] + plan["retake_shots"],
                     new_shots=[], retake_shots=[], base_plan_id=plan["plan_id"],
-                    acceptance_loop=acceptance_policy(plan["reuse_shots"]))
+                    acceptance_loop=acceptance_policy(plan["reuse_shots"],
+                        previously_retried_shots=plan["acceptance_loop"].get("previously_retried_shots", ())))
         from pianchang.video_execution import execution_limits
-        plan["execution_limits"]=execution_limits(plan,len(plan["reuse_shots"])*plan["acceptance_loop"]["max_repairs_per_shot"],len(view["project"]["shots"]))
+        plan["execution_limits"]=execution_limits(plan,authorized_video_count(plan),len(view["project"]["shots"]))
         plan["plan_id"] = digest_json(plan)
         return plan
     if "proposal_id" not in body:
@@ -289,7 +306,7 @@ def _approved_plan(view, previous, body):
         plan["reuse_shots"] = [sid for sid in plan["reuse_shots"] if sid not in retakes]
     plan.update(approval_proposal=proposal, proposal_id=proposal["proposal_id"], base_plan_id=plan["plan_id"])
     from pianchang.video_execution import execution_limits
-    plan["execution_limits"]=execution_limits(plan,len(plan["new_shots"])+len(plan["retake_shots"])+len(plan["acceptance_loop"]["shot_ids"])*plan["acceptance_loop"]["max_repairs_per_shot"],len(view["project"]["shots"]))
+    plan["execution_limits"]=execution_limits(plan,authorized_video_count(plan),len(view["project"]["shots"]))
     plan["plan_id"] = digest_json(plan)
     return plan
 
@@ -336,6 +353,8 @@ def check_legacy_video_scope(service, pid, shot_id=None):
         return
     from pianchang.studio_assets import studio_project_for_video
     view = studio_project_for_video(service, pid)
+    if "generation_request_limit" in view["project"]:
+        raise ValueError("此故事有分组拍摄和总请求额度，请使用已确认的制作计划。")
     if not view["spec"].get("revision_id"):
         return
     shots = [s["id"] for s in view["project"]["shots"] if s.get("required_refs")
@@ -347,13 +366,14 @@ def check_legacy_video_scope(service, pid, shot_id=None):
 
 
 @traced("studio.video_job.resume", kind="task", capture_inputs=False)
-def resume_video_job(service, job):
+def resume_video_job(service, job, *, explicit_continuation=False):
     """Resume the same frozen commission, not a newly computed shooting plan."""
     session = _session(service, job["run_id"], "恢复已授权的视频制作", job["project_id"])
     try:
         order=session.store.get_message(job["message_id"])
-        package, delivered = session.worker(job["message_id"],resume=order["deliveries"]["video"]!="pending")
-    except ValueError:
+        package, delivered = session.worker(job["message_id"],resume=order["deliveries"]["video"]!="pending",
+                                            explicit_continuation=explicit_continuation)
+    except VideoAgentStopped:
         path=session.folder/("video-spec-"+job["message_id"])/"agent/run.json"
         if not path.is_file():raise
         record=read_json(path)
@@ -409,9 +429,8 @@ def run_video_job(service, job, body):
             if shooting_plan.get("continuation"):
                 from pianchang.studio_recovery import prepare_continuation
                 prepare_continuation(locked_view, shooting_plan["continuation"])
-            budget = len(shooting_plan["new_shots"]) + len(shooting_plan["retake_shots"])
-            if shooting_plan.get("acceptance_loop"):
-                budget += len(shooting_plan["acceptance_loop"]["shot_ids"]) * shooting_plan["acceptance_loop"]["max_repairs_per_shot"]
+            from pianchang.video_repair import authorized_video_count
+            budget = authorized_video_count(shooting_plan)
             event("studio.video_plan.approved", {"project_id": pid, "plan": shooting_plan,
                   "authorized_video_submissions": budget}, kind="state")
         script = _source_script(session, view)

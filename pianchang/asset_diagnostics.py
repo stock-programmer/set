@@ -2,10 +2,41 @@
 import re
 
 
+IMAGE_ACCESS_ERRORS = {
+    "InvalidEndpointOrModel.NotFound": 404,
+    "InvalidEndpointOrModel.ModelIDAccessDisabled": 404,
+    "ModelNotOpen": 404,
+    "OperationDenied.ServiceNotOpen": 403,
+    "OperationDenied.PermissionDenied": 403,
+}
+
 _LABELS = {"subject": "对象外观", "asset_use": "辨识特征", "scene_use": "场景用途",
            "style": "风格", "palette": "配色", "concept": "创作意图", "voice": "音色",
            "performance": "语气", "audibility": "声音清晰度", "dialogue": "台词", "revision": "修改要求"}
 _FALLBACK_ACTION = "展开证据或查看技术日志，定位中断的位置。"
+_MODEL_NOT_FOUND = re.compile(
+    r"(?:Error code:\s*404|HTTP\s+404)\s*[-:]\s*The model or endpoint "
+    r"([A-Za-z0-9][A-Za-z0-9._/-]{0,159}) does not exist or you do not have access to it\b", re.I)
+_IMAGE_ACCESS_ACTION = ("请在「制作动态」查看旁路核对模型、修正配置和恢复补图的进度。"
+                        "需要你提供权限或接入点时，可从「回应请求」提交答复。")
+
+
+def current_image_access_guidance(recorded):
+    """Keep an immutable job's result intact while presenting the current recovery procedure."""
+    items = recorded.get("items") or []
+    summary = recorded.get("summary") or ""
+    revised = []
+    for item in items:
+        if isinstance(item, dict) and item.get("code") == "image_model_access" and item.get("action") != _IMAGE_ACCESS_ACTION:
+            previous = item.get("action")
+            if previous and summary.endswith(previous):
+                summary = summary[:-len(previous)] + _IMAGE_ACCESS_ACTION
+            item = {**item, "action": _IMAGE_ACCESS_ACTION}
+        revised.append(item)
+    if revised == items:
+        return recorded
+    return {**recorded, "items": revised, "summary": summary}
+
 
 
 def _text(value):
@@ -64,6 +95,37 @@ def _error_explanation(error, review_status, has_pin):
     return "unknown", "UNKNOWN", "资产任务停在这条错误记录：" + _short(error), _FALLBACK_ACTION
 
 
+def model_not_found_id(error):
+    rejected = _MODEL_NOT_FOUND.match(error)
+    return rejected[1] if rejected else None
+
+
+def _rejected_image_model(item, error):
+    if item.get("purpose") not in {"portrait", "scene", "prop", "costume"}:
+        return None
+    if "rejected_image_model" in item:
+        return item["rejected_image_model"]
+    # Old orders did not associate errors with a specific route. Text and review
+    # models also run within this order, so an arbitrary endpoint name is ambiguous.
+    model = model_not_found_id(error)
+    if model and model.startswith("doubao-seedream-"):
+        return model
+    return None
+
+
+def asset_failure_summary(summary, issues):
+    models = {}
+    for issue in issues:
+        if issue.get("code") == "image_model_access":
+            model = issue["model_id"]
+            models[model] = models.get(model, 0) + 1
+    if not models:
+        return summary
+    blocked = "、".join(f"{model}（{count} 项）" for model, count in models.items())
+    statuses = sorted({str(i.get("http_status", 404)) for i in issues if i.get("code") == "image_model_access"})
+    return f"{summary} 上次调用生图模型 {blocked}时收到 HTTP {' / '.join(statuses)}，供应商拒绝访问。{_IMAGE_ACCESS_ACTION}"
+
+
 def asset_diagnostic(item, name=None, *, trace_id=None, span_id=None):
     """Project existing evidence only. Callers may supply an exact trace/span association."""
     if item.get("status") != "needs_attention":
@@ -93,7 +155,13 @@ def asset_diagnostic(item, name=None, *, trace_id=None, span_id=None):
     error = _text(item.get("error"))
     observer_error = _text(review.get("observation_error"))
     purpose = item.get("purpose")
-    if error:
+    rejected = _rejected_image_model(item, error)
+    provider_code = item.get("rejected_image_code") or "InvalidEndpointOrModel.NotFound"
+    if rejected:
+        stage, verdict = "generate", "FAIL"
+        reason = f"上次生图时服务商拒绝访问模型或推理端点 {rejected}（HTTP {IMAGE_ACCESS_ERRORS.get(provider_code, 404)}，{provider_code}）。"
+        action = _IMAGE_ACCESS_ACTION
+    elif error:
         stage, verdict, reason, action = _error_explanation(error, status, bool(pin))
     elif observer_error:
         stage, verdict = "review", "UNKNOWN"
@@ -115,6 +183,8 @@ def asset_diagnostic(item, name=None, *, trace_id=None, span_id=None):
         reason = "现有记录没有指出具体未通过哪一项。"
         action = _FALLBACK_ACTION
     return {"subject_id": item.get("subject_id"), "name": name or brief.get("name") or item.get("subject_id"),
+            **({"code": "image_model_access", "model_id": rejected, "provider_code": provider_code,
+                "http_status": IMAGE_ACCESS_ERRORS.get(provider_code, 404)} if rejected else {}),
             "purpose": purpose, "stage": stage, "verdict": verdict, "reason": reason, "action": action,
             "revision_id": pin.get("revision_id"), "attempt_count": attempt_count,
             "trace_id": trace_id, "span_id": span_id or review.get("span_id"), "evidence": checks,

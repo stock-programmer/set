@@ -1,4 +1,6 @@
 """Read frozen production inputs and real job outcomes, without submitting media."""
+import re
+
 from pianchang.bailian_video import IMAGE_PURPOSES, VideoError, config_for_shooting_plan, validate_reference_capabilities
 from pianchang.collab_store import CollabStore
 from trace_system import event, traced
@@ -18,12 +20,23 @@ def _production_diagnostics(service, session):
     view=studio_project_for_video(service,session["project_id"])
     current=current_commission(service,session["project_id"],view=view)
     with service.lock:
-        jobs=[{k:j.get(k) for k in ("id","kind","status","message","error","trace_id","updated_at")}
+        jobs=[{k:j.get(k) for k in ("id","kind","status","message","error","trace_id","updated_at","commission_id")}
               for j in service.state["jobs"] if j.get("project_id")==session["project_id"]
               and (j.get("id")==current.get("job_id") or
                    j.get("session_id")==session["id"] and j.get("status") in {"failed","interrupted"})][-6:]
+    for job in jobs:
+        if job["kind"] == "pi_video":
+            # A chat turn's stored message can itself be an earlier model's diagnosis.
+            job.pop("message")
+            job["scope"] = "production_handoff" if job["commission_id"] else "conversation_without_production_handoff"
+            if re.fullmatch(r"[0-9a-f]{32}", str(job["trace_id"])):
+                receipts = service.tracer.get_events(job["trace_id"], names=["pi.model.receipt"], limit=1)
+                if receipts:
+                    receipt = receipts[0]
+                    job["observed_model_response"] = {"model": service.tracer.resolve(receipt["data"])["model"],
+                        "timestamp": receipt["timestamp"], "trace_seq": receipt["trace_seq"]}
     result={"commission":current,"jobs":jobs,"shots":[],
-        "evidence_scope":"Live read of frozen inputs and retained job outcomes; no generation or replay.",
+        "evidence_scope":"jobs 是本地保存的历史记录。observed_model_response 是该次对话中实际收到的一次模型响应。账户余额、充值到账和其他模型的实时可用性未经查询。",
         "interpretation":"last_execution=null means no linked conversation continuation, not that generation never ran. Approved asset count does not prove model input compatibility."}
     if not current.get("commission_id"):return result
     store=CollabStore(view["store_path"])

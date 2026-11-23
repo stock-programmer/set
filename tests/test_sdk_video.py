@@ -12,7 +12,7 @@ from unittest.mock import patch
 from pianchang.bailian_video import build_request, config_for_references, config_for_shooting_plan, load_config, reference_pin, VideoError
 from pianchang.model_routes import SDK_VERSION
 from pianchang.reference_usage import verify_reference_exchange
-from pianchang.video_agent import VideoRunner, verify_reference_receipt
+from pianchang.video_agent import VideoRunner, submission_rejection, verify_reference_receipt
 from trace_system import Tracer, use_context
 
 
@@ -218,21 +218,39 @@ class VideoRouteTests(unittest.TestCase):
     @unittest.skipUnless(has_sdk(), "requires pinned optional LiteLLM SDK")
     def test_remote_rejection_is_bound_to_its_actual_http_response(self):
         import httpx
-        self.cfg["routes"]["video.text_to_video"] = "test-video"
-        self.write_config()
-        runner = VideoRunner(config_for_references(self.settings, []))
-        payload = build_request(runner.config, "An empty room.")
+        refs = []
+        for index in range(3):
+            data = f"offline portrait {index}".encode()
+            refs.append({"asset_id":f"asset-{index}","revision_id":"r1","sha256":"a"*64,
+                "media_sha256":hashlib.sha256(data).hexdigest(),"subject_id":f"actor-{index}","purpose":"portrait",
+                "provider_url":"data:image/jpeg;base64,"+base64.b64encode(data).decode(),"mime_type":"image/jpeg",
+                "bytes":len(data),"width":320,"height":320})
+        runner = VideoRunner(config_for_references(self.settings, refs))
+        payload = build_request(runner.config, "Offline scene.", resolved_refs=refs)
+        metadata = {"shot_id":"S003", "required_refs":[reference_pin(r) for r in refs]}
+        calls = []
         def rejected(request):
-            return httpx.Response(400,json={"error":{"code":"InvalidParameter","message":"bad model"}},
+            calls.append(request.method)
+            return httpx.Response(400,json={"error":{"code":"InputImageSensitiveContentDetected.PrivacyInformation",
+                                  "message":"Invalid reference input content[1] and content[3]."}},
                                   headers={"x-request-id":"rejected-ark"})
         with patch("pianchang.sdk_transport._upstream_transport", side_effect=lambda:httpx.MockTransport(rejected)):
             with self.assertRaises(VideoError):
-                runner.submit(payload)
+                runner.submit(payload, metadata, resolved_refs=refs)
+            with self.assertRaisesRegex(VideoError, "rejected|PrivacyInformation"):
+                runner.submit(payload, metadata, resolved_refs=refs)
+        self.assertEqual(calls, ["POST"])
         path = next(runner.config.output_dir.glob("*/job.json"))
         job = json.loads(path.read_text(encoding="utf8"))
         receipt = job["reference_receipt"]
         self.assertEqual(receipt["status"], "PROVIDER_REJECTED")
         self.assertEqual(verify_reference_exchange(job,receipt,receipt["trace_id"])["status"],"MATCHED_RESPONSE")
+        evidence = submission_rejection(job, path)
+        self.assertEqual(evidence["provider_request_id"], "rejected-ark")
+        self.assertEqual(evidence["shot_id"], "S003")
+        self.assertEqual([(r["asset_id"],r["revision_id"]) for r in evidence["references"]], [("asset-0","r1"),("asset-2","r1")])
+        receipt["provider_request_id"] = "unmatched"
+        self.assertIsNone(submission_rejection(job, path))
 
     @unittest.skipUnless(has_sdk(), "requires pinned optional LiteLLM SDK")
     def test_wrong_task_on_content_lookup_cannot_download_another_tasks_file(self):

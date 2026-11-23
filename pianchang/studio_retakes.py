@@ -65,8 +65,14 @@ def _report_failures(view, previous, reusable_shots):
         return []
     failures = []
     workdir = (Path(view["store_path"]).parent / "runs" / view["run_id"]).resolve()
+    package = previous["content"]
+    approvals = package.get("manual_approvals", {})
     for sid in reusable_shots:
-        summary = previous["content"].get("reports", {}).get(sid, {})
+        summary = package.get("reports", {}).get(sid, {})
+        if sid in approvals:
+            from pianchang.shot_approval import approval_matches
+            if approval_matches(approvals[sid], package["request_id"], package["project"], sid, package["shots"][sid], summary):
+                continue
         if summary.get("status") != "FAIL" or not summary.get("report_path"):
             continue
         path = Path(summary["report_path"]).resolve()

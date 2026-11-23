@@ -21,12 +21,18 @@ from pianchang.story_spec import digest_json
 from pianchang.studio_assets import studio_project_for_video
 from pianchang.studio_jobs import _session,_source_script,_handoff_spec
 from trace_system import use_context
-from pianchang.video_collab_agent import analyze_impact
+from pianchang.video_collab_agent import VideoWorkspace, analyze_impact
 from pianchang.web_server import create_server
 
 
 class PreviewAccessTests(unittest.TestCase):
     def test_http_full_gate_flow_and_stale_addresses(self):
+        self._run_http_flow(manual=False)
+
+    def test_manual_pass_preserves_cut_checks_and_completes_existing_commission(self):
+        self._run_http_flow(manual=True)
+
+    def _run_http_flow(self, *, manual):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary)
             with patch.dict(os.environ,{"AGENT_TRACE_DIR":str(root/"traces")}),\
@@ -71,10 +77,12 @@ class PreviewAccessTests(unittest.TestCase):
                                 "dependency_sha256":job["metadata"]["dependency_sha256"]}
                             inspections[sid]=inspect_media(media,session.folder/"offline-inspections"/sid,interval_s=1,max_frames=2)
                         write_json(work/"clips.json",clips)
-                        preview=export_preview([{"shot_id":s["id"],"path":clips[s["id"]]["media_path"],"sha256":clips[s["id"]]["media_sha256"]} for s in project["shots"]],session.folder/"offline-preview")
-                        preview["export_manifest_sha256"]=digest_json(read_json(preview["manifest_path"]))
+                        write_json(work/"impact.json",impact)
+                        if not manual:
+                            preview=export_preview([{"shot_id":s["id"],"path":clips[s["id"]]["media_path"],"sha256":clips[s["id"]]["media_sha256"]} for s in project["shots"]],session.folder/"offline-preview")
+                            preview["export_manifest_sha256"]=digest_json(read_json(preview["manifest_path"]))
                         prior=None;report_paths=[]
-                        def publish(verdict,*,omit_required=False):
+                        def publish(verdict,*,omit_required=False,stage_only=False,cut_failed=False,legacy=False):
                             nonlocal prior
                             reports={}
                             for shot in project["shots"]:
@@ -82,18 +90,35 @@ class PreviewAccessTests(unittest.TestCase):
                                 contract=create_contract(project,sid,width=160,height=240)
                                 rows=[{"criterion_id":r["criterion_id"],"required":r["required"],"status":verdict if sid=="S001" else "PASS",
                                     "reason":"explicit offline mocked semantic verdict"} for r in contract["requirements"]]
+                                if stage_only:
+                                    for row in rows:
+                                        if sid == "S001" and row["criterion_id"] != "action_sequence":
+                                            row["status"] = "PASS"
+                                        if cut_failed and row["criterion_id"] == "continuity:S001->S002":
+                                            row["status"] = "FAIL"
+                                    rows.extend({"criterion_id":cid, "required":True, "status":"PASS", "reason":"bound offline fixture"}
+                                                for cid in ("evidence_integrity", "candidate_binding"))
                                 if omit_required and sid=="S001":rows=[r for r in rows if r["criterion_id"]!="action_sequence"]
                                 report={"schema_version":"explicit-offline-report/1","shot_id":sid,"project_sha256":digest_json(project),
                                     "media_sha256":clips[sid]["media_sha256"],"inspection_sha256":digest_json(inspections[sid]),
                                     "status":verdict if sid=="S001" else "PASS","task_complete":verdict=="PASS" or sid!="S001","results":rows}
+                                if stage_only:
+                                    report["contract_sha256"] = digest_json(contract)
+                                    report["task_complete"] = all(r["status"] == "PASS" for r in rows if r["required"])
+                                    report["status"] = "PASS" if report["task_complete"] else "FAIL"
                                 write_json(folder/"contract.json",contract);write_json(folder/"report.json",report);report_paths.append(folder/"report.json")
                                 reports[sid]={"shot_id":sid,"report_path":str(folder/"report.json"),"report_sha256":digest_json(report),"inspection_path":inspections[sid]["manifest_path"],
                                     "status":report["status"],"unresolved":[] if report["status"]=="PASS" else [r["criterion_id"] for r in rows if r["required"]]}
                             write_json(work/"reports.json",reports)
+                            if stage_only:
+                                return reports
                             package={"project":project,"script_ref":view["script_ref"],"spec_ref":view["spec"],"shots":clips,"reports":reports,
                                 "impact":impact,"media_refs":{},"preview":preview,"media_accepted":True,"label":"explicit offline mock verdicts"}
+                            if legacy:
+                                package.pop("spec_ref")
                             prior=session.store.publish_asset(view["story_id"]+"/production",package,kind="production",producer="video",story_id=view["story_id"],
-                                parent_revision=prior["revision_id"] if prior else None,correlation_id=view["run_id"])
+                                parent_revision=prior["revision_id"] if prior else None,correlation_id=view["run_id"],
+                                dependencies=[{"asset_id":spec["asset_id"],"revision_id":spec["revision_id"],"role":"production_input"}])
                             return prior
                         server=create_server(service,port=0);worker=threading.Thread(target=server.serve_forever,daemon=True);worker.start()
                         port=server.server_address[1]
@@ -116,6 +141,47 @@ class PreviewAccessTests(unittest.TestCase):
                             draft_url=shot["preview_url"]
                             sample=diagnostic.read_bytes()[:8]
                             self.assertEqual(http("GET",draft_url,headers={"Range":"bytes=0-7"}),(206,sample))
+                            if manual:
+                                sid="S001"
+                                approve_url=f"/api/projects/{pid}/studio/shots/approve"
+                                reports=publish("FAIL",stage_only=True,cut_failed=True)
+                                body={"request_id":request["message_id"], "shot_id":sid,
+                                      "media_sha256":clips[sid]["media_sha256"], "report_sha256":reports[sid]["report_sha256"]}
+                                status,response=http("POST",approve_url,body)
+                                self.assertEqual(status,200,response)
+                                blocked=json.loads(response)["delivery"]
+                                self.assertFalse(blocked["delivered"])
+                                self.assertIn("continuity:S001->S002",{row["criterion_id"] for row in blocked["issues"]})
+                                self.assertFalse(preview_status(service,pid)["ready"])
+                                resumed=VideoWorkspace(script=script["content"], script_ref=view["script_ref"], directory=work,
+                                    text_config=None, video_config=None, template_project=project, previous=None, decision_client=None,
+                                    vision_config=None, progress=None, inbound_message=request, shooting_plan=plan)
+                                resumed.project,resumed.shots,resumed.reports=project,clips,reports
+                                issues=resumed.acceptance_gate(validate=False)["issues"]
+                                self.assertTrue(all(i["criterion_id"].startswith("continuity:") for i in issues),issues)
+                                reports=publish("FAIL",stage_only=True)
+                                self.assertNotEqual(http("POST",approve_url,body)[0],200)
+                                body["report_sha256"]=reports[sid]["report_sha256"]
+                                status,response=http("POST",approve_url,body)
+                                self.assertEqual(status,200,response)
+                                approved=json.loads(response)
+                                self.assertTrue(approved["delivery"]["delivered"],approved)
+                                self.assertEqual(json.loads(http("POST",approve_url,body)[1]),approved)
+                                delivery=session.store.get_asset(view["story_id"]+"/production")["content"]
+                                self.assertEqual(list(delivery["manual_approvals"]),[sid])
+                                self.assertEqual(read_json(reports[sid]["report_path"])["status"],"FAIL")
+                                selected=read_json(delivery["preview"]["manifest_path"])["clips"]
+                                self.assertEqual([r["shot_id"] for r in selected],["S001","S002","S003"])
+                                self.assertEqual(len(session.store.messages(view["run_id"],message_type="production.result")),1)
+                                detail=json.loads(http("GET",f"/api/projects/{pid}")[1])
+                                self.assertTrue(detail["preview_gate"]["ready"],detail["preview_gate"])
+                                url=detail["export"]["video_url"]
+                                self.assertEqual(http("GET",url,headers={"Range":"bytes=0-7"})[0],206)
+                                receipt=next(p for p in (work/"manual-approvals").glob("*.json")
+                                             if read_json(p)["report_sha256"]==body["report_sha256"])
+                                receipt.unlink()
+                                self.assertEqual(http("GET",url)[0],409)
+                                return
                             publish("FAIL");self.assertFalse(preview_status(service,pid)["ready"])
                             progress=read_progress()
                             self.assertFalse(progress["preview_gate"]["ready"])
@@ -132,7 +198,7 @@ class PreviewAccessTests(unittest.TestCase):
                             detail=json.loads(http("GET",f"/api/projects/{pid}")[1]);self.assertIsNone(detail["export"])
                             publish("UNKNOWN");self.assertFalse(preview_status(service,pid)["ready"])
                             publish("PASS",omit_required=True);self.assertFalse(preview_status(service,pid)["ready"])
-                            package=publish("PASS");gate=require_preview(service,pid);self.assertTrue(gate["ready"])
+                            package=publish("PASS",legacy=True);gate=require_preview(service,pid);self.assertTrue(gate["ready"])
                             detail=json.loads(http("GET",f"/api/projects/{pid}")[1]);self.assertTrue(detail["preview_gate"]["ready"])
                             url=detail["export"]["video_url"]
                             self.assertEqual(http("GET",url)[0],200)

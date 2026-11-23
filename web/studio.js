@@ -21,18 +21,25 @@ function studioLocal(id) {
 function studioPath(id) { return "/api/projects/" + encodeURIComponent(id) + "/studio"; }
 function studioRedraw(id) {
   if(state.projectId===id && !state.loading && typeof renderHeader==="function")renderHeader();
+  if (state.step==="studio" && state.projectId===id && studioLocal(id).section==="video" && studioAssetInteractionActive()) {
+    studioLocal(id).refreshDue=true;
+    return;
+  }
   if (["studio","story"].includes(state.step) && state.projectId === id && !state.loading && !state.creating) renderStage({preserveAgentEditing:true});
 }
 async function studioRefresh(id, quiet=false) {
-  const view = studioLocal(id), token = ++view.token;
+  const view = studioLocal(id), videoDetail = view.videoReadMode === "video";
+  if (quiet && videoDetail && (view.loading || view.videoPollToken === view.token)) return;
+  const background = quiet && videoDetail && view.data?.projection === "video" &&
+    view.data.project_id === id && !view.error;
+  const token = ++view.token;
   view.readController?.abort();
   const controller=typeof AbortController==="function"?new AbortController():null;
   view.readController=controller;
   const previousError=view.error;
   let changed = true;
-  view.loading = true; view.error = null;
+  view.videoPollToken = background ? token : null; view.loading = !background; view.error = null;
   try {
-    const videoDetail=view.videoReadMode==="video";
     const data = await request(studioPath(id)+(videoDetail?"/video-detail":""),{signal:controller?.signal});
     if (view.token === token) {
       if(videoDetail){
@@ -47,7 +54,7 @@ async function studioRefresh(id, quiet=false) {
   } finally {
     if (view.readController===controller) view.readController=null;
     if (view.token === token) {
-      view.loading = false; view.lastRead = Date.now();
+      view.videoPollToken = null; view.loading = false; view.lastRead = Date.now();
       if (quiet && studioAssetInteractionActive()) view.refreshDue=true;
       else if (changed) studioRedraw(id);
       if (changed && state.projectId === id && typeof renderJobs === "function") renderJobs();
@@ -57,12 +64,16 @@ async function studioRefresh(id, quiet=false) {
 function studioAssetInteractionActive() {
   const focused = document.activeElement;
   return (focused?.matches?.("textarea,input,select") && focused.closest?.(".studio-inspector")) ||
-    [...(document.querySelectorAll?.(".studio-inspector audio") || [])].some(audio => !audio.paused);
+    [...(document.querySelectorAll?.(".studio-inspector audio, .studio-take video") || [])].some(media => !media.paused);
 }
 function studioPollAssets(force=false) {
   if (state.step !== "studio" || state.creating || !state.projectId) return;
   const view = studioLocal(state.projectId);
   if (["review", "video"].includes(view.section)) {
+    if (view.refreshDue && !view.loading && !view.pending && !studioAssetInteractionActive()) {
+      view.refreshDue=false;
+      studioRedraw(state.projectId);
+    }
     if (!view.pending && !view.loading && Date.now() - view.lastRead >= 5000 &&
         visibleJobs().some(job => ACTIVE.has(job.status) && ["studio_review", "studio_video"].includes(job.kind))) void studioRefresh(state.projectId,true);
     return;
@@ -174,10 +185,11 @@ function studioSelectSubject(view, subjectId, purpose, pin=null) {
   view.message = ""; view.lastTrace = null; renderStage();
   document.getElementById?.("studio-asset-detail")?.scrollIntoView?.({block:"start"});
 }
-async function studioWrite(id, change, done, {refreshOnError = false, pendingApproval = null} = {}) {
+async function studioWrite(id, change, done, {refreshOnError = false, pendingApproval = null, continuation = null} = {}) {
   const view = studioLocal(id);
   if (view.pending || view.loading || state.projectId !== id) return;
-  view.pending = true; view.pendingApproval = pendingApproval; view.message = ""; view.lastTrace = null; studioRedraw(id);
+  view.pending = true; view.pendingApproval = pendingApproval; view.continuationReceipt = continuation;
+  view.message = ""; view.lastTrace = null; studioRedraw(id);
   try {
     const result = await change();
     view.message = done(result); view.lastTrace = result.trace_id || result.job?.trace_id;
@@ -263,6 +275,10 @@ function studioAssetProblems(work, entities, view, id) {
     const entity = entities.find(e => e.id === item.subject_id);
     const issue = item.diagnostic || {subject_id:item.subject_id, name:entity?.name, purpose:item.purpose, trace_id:item.trace_id};
     const row = node("article","studio-asset-problem");
+    Object.assign(row.dataset, {assetJobId:item.job_id || "", subjectId:item.subject_id, purpose:item.purpose,
+      assetId:item.candidate?.asset_id || "", revisionId:item.candidate?.revision_id || "",
+      candidateSha:item.candidate?.sha256 || "", reviewSha:item.review?.review_ref?.sha256 || ""});
+    row.tabIndex = -1;
     const heading = node("div","studio-problem-heading");
     heading.append(node("strong","",assetIssueName(issue)));
     if (issue.verdict === "FAIL") heading.append(pill("FAIL","未通过"));
@@ -289,6 +305,16 @@ function studioAssetProblems(work, entities, view, id) {
     const actions = node("div","studio-actions");
     if (entity) {
       const candidate = entity.references?.find(ref => sameAssetPin(ref,item.candidate));
+      const imageUrl = item.purpose !== "voice" && candidate && studioMediaUrl(candidate.media_url, id);
+      if (!selected && imageUrl && item.review?.review_ref?.sha256) {
+        const image = node("img","studio-problem-image");
+        image.alt = entity.name + "的待审" + (studioPurposes[item.purpose] || item.purpose) + " " + candidate.revision_id;
+        image.loading = "lazy"; image.src = imageUrl;
+        const open = studioLink(imageUrl,"");
+        open.target = "_blank"; open.rel = "noopener";
+        open.append(image,node("span","","查看候选原图"));
+        row.append(open);
+      }
       append(actions, button("查看素材与处理选项",()=>studioSelectSubject(view,item.subject_id,item.purpose,item.candidate),{small:true,quiet:true}),
         studioHumanApproval(item,candidate,view,id,entity.name));
     }
@@ -672,7 +698,7 @@ function studioProgressMonitor(projectId,jobId,{standalone=false,onUpdate=null,o
   const heading = el("div","live-heading"); heading.append(title,phase);
   const count = el("p","live-count","正在读取镜头记录…");
   count.setAttribute("aria-live","polite");
-  const bar = el("progress","live-bar"); bar.setAttribute("aria-label","已生成镜头数"); bar.hidden=true;
+  const bar = el("progress","live-bar"); bar.setAttribute("aria-label","已有素材的镜头数"); bar.hidden=true;
   const reason = el("p","live-reason"); reason.hidden=true;
   const original = el("details","live-notice"); original.hidden=true;
   const originalReason=el("p"); original.append(el("summary","","原委托的停止原因"),originalReason);
@@ -702,7 +728,7 @@ function studioProgressMonitor(projectId,jobId,{standalone=false,onUpdate=null,o
       selectedId=selectedSrc=null; preview.hidden=true; return;
     }
     selectedId=row.shot_id;
-    caption.textContent=row.shot_id + " · 镜头预览 · " + shotAcceptanceLabel(row.acceptance_status);
+    caption.textContent=row.shot_id + " · 镜头预览 · " + (row.human_approved ? "已人工通过" : shotAcceptanceLabel(row.acceptance_status));
     video.setAttribute("aria-label",row.shot_id + " 候选片段");
     if (source !== selectedSrc) { video.src=source; selectedSrc=source; }
     preview.hidden=false;
@@ -722,16 +748,19 @@ function studioProgressMonitor(projectId,jobId,{standalone=false,onUpdate=null,o
     title.textContent="本次制作进度";
     phase.textContent=data.phase==="completed" && (data.preview_gate?.ready!==true || data.production_complete!==true)
       ? "制作任务已结束" : progressPhases[data.phase] || "正在核对进度";
-    const deliveryLabel = data.preview_gate?.ready===true && data.production_complete===true ? "" : " · 整片待交付";
-    count.textContent = data.total ? `已生成 ${data.completed} / ${data.total} 个镜头${deliveryLabel}`
+    const deliveredHere = data.preview_gate?.ready===true && !!data.message_id && data.preview_gate.request_id===data.message_id;
+    if (deliveredHere) phase.textContent="成片已交付 · 可预览";
+    const deliveryLabel = deliveredHere || (data.preview_gate?.ready===true && data.production_complete===true) ? "" : " · 整片待交付";
+    const mediaCount = `已有镜头素材 ${data.completed} / ${data.total}`;
+    count.textContent = data.total ? mediaCount + deliveryLabel
       : ["queued","running"].includes(data.job_status) ? "本次委托尚无镜头进度记录" : "本次委托没有可核对的镜头记录";
     if (data.current_shot_id && ["preparing","generating"].includes(data.phase)) count.textContent += " · 当前 " + data.current_shot_id;
     bar.hidden=!data.total; if (data.total) { bar.max=data.total; bar.value=data.completed; }
     const superseded = /^正在准备工具与输入[。…\s]*$/.test(data.reason || "") &&
       (data.completed > 0 || !["queued","preparing"].includes(data.phase));
-    reason.textContent=superseded ? "" : data.reason || ""; reason.hidden=!reason.textContent;
-    original.hidden=!data.original_reason || data.original_reason===data.reason;
-    originalReason.textContent=data.original_reason || "";
+    reason.textContent=superseded || deliveredHere ? "" : data.reason || ""; reason.hidden=!reason.textContent;
+    originalReason.textContent=data.original_reason || (deliveredHere && data.job_status!=="succeeded" ? data.reason : "") || "";
+    original.hidden=!originalReason.textContent || originalReason.textContent===reason.textContent;
     const stamp=Date.parse(data.updated_at || "");
     lastEvent.textContent=Number.isFinite(stamp) ? "最近记录 " + new Date(stamp).toLocaleString("zh-CN",{hour12:false}) : "";
     const ids = new Set(data.shots.map(shot=>shot.shot_id));
@@ -760,8 +789,8 @@ function studioProgressMonitor(projectId,jobId,{standalone=false,onUpdate=null,o
       parts.play.hidden=!studioClipPreviewUrl(projectId,jobId,shot);
       parts.status.textContent=progressStatuses[shot.status] || "待核实";
       parts.acceptance.hidden=!["ready","reused"].includes(shot.status);
-      parts.acceptance.dataset.verdict=shot.acceptance_status || "UNKNOWN";
-      parts.acceptance.textContent=parts.acceptance.hidden ? "" : shotAcceptanceLabel(shot.acceptance_status);
+      parts.acceptance.dataset.verdict=shot.human_approved ? "PASS" : shot.acceptance_status || "UNKNOWN";
+      parts.acceptance.textContent=parts.acceptance.hidden ? "" : shot.human_approved ? "已人工通过" : shotAcceptanceLabel(shot.acceptance_status);
       parts.detail.textContent=shot.reason || ""; parts.detail.hidden=!shot.reason;
     }
     const first = data.shots.find(row=>studioClipPreviewUrl(projectId,jobId,row));
@@ -771,7 +800,7 @@ function studioProgressMonitor(projectId,jobId,{standalone=false,onUpdate=null,o
     traceLink.hidden=!/^[a-f0-9]{32}$/.test(traceId || "");
     if (!traceLink.hidden) traceLink.href=(standalone ? studioWorkbenchOrigin() : "") + "/#step=traces&trace=" + traceId;
     const summary = [phase.textContent];
-    if (data.total > 0) summary.push(`已生成 ${data.completed} / ${data.total} 个镜头`);
+    if (data.total > 0) summary.push(mediaCount);
     if (data.current_shot_id && ["preparing","generating"].includes(data.phase)) summary.push("当前 " + data.current_shot_id);
     sample = { status:data.job_status, updatedAt:data.updated_at, readAt:Date.now(), text:summary.join(" · ") };
     if (onRead && typeof setTimeout==="function") {
@@ -876,12 +905,21 @@ function studioCurrentMonitor(id, view) {
   if ((view.monitor.showRecorded(recorded) || created) && view.monitor.sample()?.recorded) renderJobs();
   return view.monitor;
 }
+function videoRoutesChanged(previous, proposed) {
+  return Object.entries(proposed || {}).some(([purpose, route]) => {
+    // Plans made before route snapshots always execute through the Bailian client.
+    if (!previous) return route.adapter !== "bailian";
+    const frozen = previous[purpose];
+    return !frozen || Object.keys(route).some(key => route[key] !== frozen[key]);
+  });
+}
+
 function studioVideoPlan(data, catalog, view) {
   const execution=data.video_execution;
-  const frozenPlan=data.projection==="video" && execution?.commission_id;
+  const frozenPlan=execution?.commission_id && (data.projection==="video" || !data.video_plan);
   const plan = frozenPlan ? execution.plan : data.video_plan;
   const panel = node("section", "studio-video-plan");
-  panel.append(node("h3", "", frozenPlan?"本次拍摄计划 · 已确认":"本次拍摄计划"));
+  panel.append(node("h3", "", execution?.commission_id?"本次拍摄计划 · 已确认":"本次拍摄计划"));
   if (!plan?.plan_id || ![plan.new_shots,plan.retake_shots,plan.reuse_shots].every(Array.isArray)) {
     panel.append(note(data.video_plan_error || "镜头计划尚未就绪，请刷新记录。", true));
     return panel;
@@ -892,33 +930,110 @@ function studioVideoPlan(data, catalog, view) {
     panel.append(note("额外重拍申请尚未就绪，请刷新记录。", true));
     return panel;
   }
-  const groups = [[plan.continuation ? "补拍" : "新拍", plan.new_shots], ["重拍", plan.retake_shots], [plan.continuation ? "沿用" : "复用", plan.reuse_shots]];
-  if (plan.video_routes) {
+  function shotGroups(p) {
+    return [[p.continuation ? "补拍" : "新拍", p.new_shots], ["重拍", p.retake_shots], [p.continuation ? "沿用" : "复用", p.reuse_shots]];
+  }
+  const groups = shotGroups(plan);
+  if (plan.generation_tasks) {
+    panel.append(note("生成请求总上限 " + plan.generation_request_limit + " 次，首拍和重拍共用。"));
+    panel.append(studioRows(plan.generation_tasks.map(task => [
+      task.id + " · " + task.duration_s + " 秒", task.creative_shots.join(" → ")
+    ])));
+  }
+  function showRoutes(routes) {
     const labels = {"video.text_to_video": "文生视频", "video.reference_to_video": "参考生视频"};
-    panel.append(studioRows(Object.entries(plan.video_routes).map(([purpose, route]) =>
+    panel.append(studioRows(Object.entries(routes).map(([purpose, route]) =>
       [labels[purpose] || purpose, route.model_id + " · " + route.provider + " / " + route.account])));
   }
-  if (plan.continuation) panel.append(note("已保留上次生成的 " + plan.reuse_shots.length + " 个镜头，先补齐剩余镜头。已有候选若未通过验收，也会进入 Agent 的自动修复循环。"));
-  if (plan.acceptance_loop) panel.append(note("已生成的镜头可单独预览。Agent 会根据验收记录调整提示词、使用固定参考重拍或修改本地视频，再复验镜头和相邻衔接。所有必过项通过后才交付整片。每镜头最多自动重拍 " + plan.acceptance_loop.max_repairs_per_shot + " 次；达到上限仍未通过会保留为制作未完成。"));
-  if (plan.blocked_reason) panel.append(note(plan.blocked_reason,true));
-  if(frozenPlan)panel.append(studioRows(groups.map(([label, shots]) => [label + " " + shots.length + " 个",shots.join("、") || "无"])));
   const frozen=execution?.plan?.acceptance_loop?.shot_ids;
   const sameScope=execution?.commission_id && Array.isArray(frozen) && JSON.stringify([...frozen].sort())===JSON.stringify([...(plan.acceptance_loop?.shot_ids||[])].sort());
   const sameVersions=execution?.commission_id && sameAssetPin(execution.script_ref,catalog.script_ref) && sameAssetPin(execution.spec_ref,catalog.spec);
   if(execution?.commission_id){
-    panel.append(note("补充要求、只读核对与继续制作都进入当前视频 Agent 对话，不会新建另一套执行目标。"));
-    if(execution.resumable)panel.append(button("继续当前制作委托",()=>studioContinueConversation(id,execution.commission_id),{primary:true,disabled:view.loading||!!view.error||busyProject()||!keyReady("video.decision")}));
+    if (execution.plan?.video_routes) showRoutes(execution.plan.video_routes);
+    else panel.append(note("此委托创建于模型路由登记前，继续执行时使用百炼视频配置。"));
+    const confirmed = execution.plan;
+    if (confirmed?.acceptance_loop) panel.append(note("每镜头最多自动重拍 " + Math.min(1,confirmed.acceptance_loop.max_repairs_per_shot) + " 次。复验仍未通过时停止，并记录具体理由。"));
+    if (Array.isArray(confirmed?.new_shots) && Array.isArray(confirmed.retake_shots) && Array.isArray(confirmed.reuse_shots)) {
+      panel.append(studioRows(shotGroups(confirmed).map(([label, shots]) => [label + " " + shots.length + " 个",shots.join("、") || "无"])));
+    }
+    const review = activeCommissionReview(id,execution.commission_id);
+    if (review) {
+      panel.append(note(reviewProgress(review)),button("向视频 Agent 补充要求",()=>setStep("agent"),{quiet:true}));
+      return panel;
+    }
+    panel.append(note("继续后，工作台核对当前委托并恢复制作。需要重拍时，使用本委托已确认的视频生成模型和剩余额度。"));
+    if(execution.resumable)panel.append(button("继续当前制作委托",()=>studioContinueConversation(id,execution.commission_id),{primary:true,disabled:view.pending||view.loading||!!view.error||busyProject()||!keyReady("video.decision")}));
     else if(execution.blockers?.length)panel.append(note(execution.blockers.join("；"),true));
     panel.append(button("向视频 Agent 补充要求",()=>setStep("agent"),{quiet:true}));
-    if(frozenPlan || sameScope && sameVersions && !extra)return panel;
+    const receipt = view.continuationReceipt?.commissionId === execution.commission_id ? view.continuationReceipt : null;
+    const jobId = receipt ? receipt.jobId : execution.last_execution?.id;
+    const job = jobId && state.jobs.find(item=>item.id===jobId && jobProjectId(item)===id);
+    const rejections = execution.submission_rejections || [];
+    const chatEndedWithoutHandoff = job?.kind === "pi_video" && !job.commission_id &&
+      ["succeeded", "interrupted"].includes(job.status);
+    let feedback = job?.result?.summary || job?.message || (receipt ? (view.pending ? "正在向视频 Agent 提交继续要求…" : view.message) : execution.last_execution?.message);
+    if (job?.error) feedback = errorText(job.error);
+    else if (chatEndedWithoutHandoff) feedback = "上次继续请求只产生了对话回复，制作尚未接续。";
+    else if (rejections.length && job?.id===execution.last_execution?.id && job.status==="interrupted") feedback = "本次制作已中断，原镜头已保留。";
+    if (feedback) {
+      const status = node("div","studio-feedback");
+      status.setAttribute("role","status");
+      const refusalTrace = rejections.length && execution.last_execution?.worker_trace_id;
+      append(status, note(feedback, !!job?.error), studioTrace(refusalTrace || job?.trace_id || (receipt ? view.lastTrace : execution.last_execution?.trace_id)));
+      panel.append(status);
+    }
+    for (const refusal of rejections) {
+      const provider = {"volcengine-ark":"火山方舟", "aliyun-bailian":"阿里云百炼"}[refusal.provider] || refusal.provider;
+      const reason = refusal.code==="InputImageSensitiveContentDetected.PrivacyInformation" ? "供应商认为参考图可能含真人" : refusal.code;
+      const references = (refusal.references || []).map(ref => `${ref.subject_id || ref.asset_id} ${ref.revision_id}`).join("、");
+      panel.append(note(`${refusal.shot_id} · ${provider}拒绝受理（HTTP ${refusal.http_status}）${reason ? " · " + reason : ""}${references ? "。涉及素材：" + references : ""}`, true));
+      if (refusal.provider_request_id) {
+        const details = node("details");
+        details.append(node("summary", "", `${refusal.shot_id} 供应商回执`), studioRows([["模型",refusal.model],["错误码",refusal.code || "未提供"],["请求 ID",refusal.provider_request_id]]));
+        panel.append(details);
+      }
+    }
+    if (frozenPlan) {
+      if (data.projection==="video" && (execution.resumable || execution.exhausted_budget)) {
+        panel.append(button(view.archiveLoading?"正在读取拍摄计划…":"查看当前模型的拍摄计划", () => {
+          if (state.projectId === id) return openProject(id,{preserveStep:true,full:true});
+        }, {quiet:true, disabled:view.archiveLoading || view.pending}));
+      } else if(data.video_plan_error) panel.append(note(data.video_plan_error,true));
+      return panel;
+    }
+    if (extra?.partial && extra.partial.request_id !== execution.commission_id) {
+      panel.append(note("额外重拍申请对应的委托已变更，请刷新拍摄计划。",true));
+      return panel;
+    }
+    const laterBudget = execution.exhausted_budget && plan.continuation?.request_id === execution.commission_id &&
+      plan.plan_id !== execution.plan?.plan_id && !plan.blocked_reason && !plan.unresolved_shots?.length;
+    if (sameScope && sameVersions && !extra && !laterBudget) {
+      if (!execution.resumable) return panel;
+      if (!videoRoutesChanged(execution.plan?.video_routes,plan.video_routes)) {
+        panel.append(note(confirmed?.video_routes ? "当前配置和已确认委托使用相同的视频路由，可继续当前委托。" : "当前配置仍使用百炼视频，可继续当前委托。"));
+        return panel;
+      }
+      if (plan.continuation?.request_id !== execution.commission_id) {
+        panel.append(note("视频模型已变更，尚无可核对的恢复记录来确定复用与补拍范围。",true));
+        return panel;
+      }
+    }
+    panel.append(node("h3","","待确认的新拍摄计划"));
   }
+  if (plan.video_routes) showRoutes(plan.video_routes);
+  if (plan.continuation) panel.append(note("可沿用 " + plan.reuse_shots.length + " 个已有镜头。已有候选仍需验收，未通过项在本次确认的额度内修复。"));
+  if (plan.acceptance_loop) panel.append(note("镜头及相邻衔接全部通过后才交付整片。每镜头最多自动重拍 " + plan.acceptance_loop.max_repairs_per_shot + " 次。"));
+  if (plan.blocked_reason) panel.append(note(plan.blocked_reason,true));
   function addAction(title, breakdown, proposalId, existingOnly=false) {
     const counts = breakdown.filter(([, shots]) => shots.length).map(([name, shots]) => name + " " + shots.length + " 个").join("，");
     panel.append(studioRows(breakdown.map(([name, shots]) => [name + " " + shots.length + " 个", shots.join("、") || "无"])));
     if(plan.acceptance_loop){
       const policy=plan.acceptance_loop,scope=existingOnly?plan.reuse_shots.length:policy.shot_ids.length;
       const initial=existingOnly?0:breakdown.filter(([name])=>/新拍|补拍|重拍/.test(name)).reduce((sum,[,ids])=>sum+ids.length,0);
-      panel.append(note("本次确认上限：生成调用 "+(initial+scope*policy.max_repairs_per_shot)+" 次，制作循环模型调用 "+Math.max(30,scope*(6+3*policy.max_repairs_per_shot)+20)+" 次；每镜头最多本地修改 "+policy.max_local_edits_per_shot+" 次。"));
+      const ids=existingOnly ? plan.reuse_shots : policy.shot_ids;
+      const remaining=ids.filter(sid=>!policy.previously_retried_shots?.includes(sid)).length;
+      const calls=(!proposalId && !existingOnly ? plan.execution_limits?.max_video_generations : null) ?? Math.min(plan.generation_request_limit ?? Infinity, initial + remaining * Math.min(1,policy.max_repairs_per_shot));
+      panel.append(note("本次确认上限：生成调用 "+calls+" 次，制作循环模型调用 "+Math.max(30,scope*(6+3*policy.max_repairs_per_shot)+20)+" 次；每镜头最多本地修改 "+policy.max_local_edits_per_shot+" 次。"));
     }
     const canStart = counts && !plan.blocked_reason && !view.pending && !view.loading && !view.error && !busyProject() && keyReady("video.decision")
       && !catalog.pending_script_ref && catalog.spec?.sha256;
@@ -965,10 +1080,16 @@ async function studioContinueConversation(id,commissionId){
   if(view.loading||view.error||!view.data?.video_execution?.resumable||view.data.video_execution.commission_id!==commissionId){view.message="当前委托已更新，请重新核对。";studioRedraw(id);return;}
   const text="继续当前制作委托 "+commissionId+"，沿用原冻结范围和剩余额度，按验收证据继续修复，全部必过项通过后再交付整片。";
   view.continuationAttempt=view.continuationAttempt?.commissionId===commissionId?view.continuationAttempt:{commissionId,id:window.crypto.randomUUID().replaceAll("-","")};
-  await studioWrite(id,()=>request("/api/pi/messages",{method:"POST",body:{scope:{project:id},role:"video",mode:"work",text,message_id:view.continuationAttempt.id}}),result=>{
-    view.continuationAttempt=null;if(result.job)acceptJob(result.job,"已将继续要求送入当前视频 Agent 会话");
-    return "已接续当前会话；制作范围、验收条件和生成额度保持冻结。";
-  });
+  const receipt = {commissionId};
+  await studioWrite(id,()=>request("/api/pi/messages",{method:"POST",body:{scope:{project:id},role:"video",mode:"work",text,message_id:view.continuationAttempt.id,continue_commission:commissionId}}),result=>{
+    if(result.job)acceptJob(result.job,"已将继续要求送入当前视频 Agent 会话");
+    receipt.jobId = result.message?.job_id || (result.queued ? null : result.job?.id);
+    view.continuationAttempt=null;
+    if (result.queued || result.message?.status==="queued") return "继续要求已排队，等待视频 Agent 处理。";
+    if (result.message?.status==="not_executed") return "继续要求未进入执行，请查看关联任务的停止原因。";
+    if (result.duplicate) return "已找到同一条继续要求，处理进度见原会话。";
+    return "视频 Agent 已收到继续要求。";
+  }, {continuation:receipt});
 }
 
 function studioExecutionLimits(data){
@@ -984,6 +1105,103 @@ function studioExecutionLimits(data){
   box.append(studioRows(rows));
   return studioDetails("执行限制 · "+(execution?.commission_id?"当前委托":"待确认计划"),box);
 }
+async function studioReadShotReviews(id, requestId) {
+  const view = studioLocal(id);
+  if (view.shotReviews?.requestId===requestId && view.shotReviews.loading) return view.shotReviews.promise;
+  const read = {requestId,loading:true};
+  view.shotReviews = read;
+  read.promise = Promise.resolve().then(() => request(studioPath(id) + "/shot-reviews?" + new URLSearchParams({request_id:requestId}))).then(result => {
+    if (result.project_id !== id || result.request_id !== requestId) throw Error("验收记录和当前委托不符，请刷新。");
+    read.result=result;
+  }).catch(error => { read.error=error.message; }).finally(() => {
+    read.loading=false;
+    if (view.shotReviews === read) studioRedraw(id);
+  });
+  studioRedraw(id);
+  return read.promise;
+}
+function studioShotApprovals(partial, id, view, includeReadOnly=false) {
+  const review = activeCommissionReview(id,partial?.request_id);
+  const rows = partial?.shots?.filter(shot => includeReadOnly || shot.can_approve || shot.human_approved) || [];
+  if (!rows.length && !includeReadOnly) return null;
+  const panel = node("section","panel studio-shot-approvals");
+  panel.dataset.requestId=partial.request_id;
+  panel.tabIndex=-1;
+  const versionCount = partial.version_count;
+  panel.append(studioSection(Number.isInteger(versionCount) ? "拍摄版本与验收报告" : "当前委托的镜头与验收报告",
+    Number.isInteger(versionCount) ? partial.total + " 个镜头组 · " + versionCount + " 个可播放版本" : "查看选用片段和对应的验收报告。"));
+  if (review) panel.append(note(reviewProgress(review)));
+  if (!rows.length) panel.append(note(partial.blocked_reason || "当前尚无待审的失败报告。可在制作进度中查看镜头和验收状态。"));
+  const retryDelivery = (partial.all_shots_accepted || (partial.available_count === partial.total && partial.shots.length === partial.total
+    && partial.shots.every(shot => shot.status === "PASS" || shot.human_approved)))
+    && !partial.review_jobs?.some(job=>ACTIVE.has(job.status));
+  for (const shot of rows) {
+    const entry = node("article","studio-shot");
+    Object.assign(entry.dataset,{requestId:partial.request_id,shotId:shot.shot_id,mediaSha:shot.media_sha256 || "",reportSha:shot.report_sha256 || ""});
+    entry.tabIndex=-1;
+    entry.append(node("h4","",shot.shot_id + (shot.human_approved ? " · 已人工通过" : shot.can_approve && !review ? " · 待人工审看" : "")));
+    if (shot.blocked_reason) entry.append(note(shot.blocked_reason));
+    const jobId = shot.job_id || partial.job_id;
+    const grid=node("div","studio-take-grid");
+    let selectedCard=null, retakes=0;
+    for (const take of shot.versions || [{...shot,selected:true}]) {
+      if (take.shot_id !== shot.shot_id) continue;
+      const selected=take.selected===true && take.media_sha256===shot.media_sha256;
+      const label=take.kind==="retake" ? "第 " + (++retakes) + " 次重拍" :
+        ({initial:"首拍",reuse:"复用版本",edit:"本地修改"})[take.kind] || "镜头视频";
+      const version=take.media_sha256?.slice(0,12) || "";
+      const card=node("section","studio-take");
+      Object.assign(card.dataset,{takeKind:take.kind || "current",selected:String(selected),mediaSha:take.media_sha256 || "",
+        reportSha:take.report_sha256 || ""});
+      card.append(node("h5","",label + (selected ? " · 当前选用" : " · 历史版本")));
+      const source=studioClipPreviewUrl(id,jobId,{...take,status:"ready"});
+      if (source) {
+        const preview=node("div","live-preview"), video=node("video","video-player");
+        video.controls=true; video.preload="none"; video.playsInline=true; video.src=source;
+        video.dataset.takeId=take.task_id || shot.shot_id;
+        video.setAttribute("aria-label",shot.shot_id + " 待审片段 " + label + " " + version);
+        preview.append(video); card.append(preview);
+        if (selected && /^[a-f0-9]{64}$/.test(shot.report_sha256 || "") && take.report_sha256===shot.report_sha256) selectedCard=card;
+      }
+      if (take.selection_reason==="rejected_regression") card.append(note("本次重拍在关键验收项上退步，已保留先前版本。"));
+      const report=selected ? shot.report : take.report;
+      if (report) {
+        const checks=node("details","studio-take-report");
+        const status=({PASS:"通过",FAIL:"未通过",UNKNOWN:"待核实"})[report.status];
+        checks.append(node("summary","",(selected ? "当前验收报告" : "此版本验收报告") + (status ? " · " + status : "")));
+        for (const result of report.results || []) {
+          if (result.required && result.status!=="PASS") checks.append(note(criterionName(result) + " · " + (result.reason || result.status)));
+        }
+        if (version) checks.append(node("code","studio-muted","视频版本 " + version));
+        card.append(checks);
+      } else if (source) card.append(note("此版本暂无可核对的验收报告。"));
+      grid.append(card);
+    }
+    entry.append(grid);
+    const retry = retryDelivery && shot === rows[0] && shot.human_approved;
+    if (selectedCard && !review && ((shot.can_approve && !shot.human_approved) || retry)) {
+      const body = {request_id:shot.request_id || partial.request_id,shot_id:shot.shot_id,
+        media_sha256:shot.media_sha256,report_sha256:shot.report_sha256};
+      const approve = button(retry ? "重新检查并合片" : "人工通过", async () => {
+        await studioWrite(id,
+          () => request(studioPath(id) + "/shots/approve",{method:"POST",body}),
+          result => {
+            void view.monitor?.refresh(true);
+            const delivery = result.delivery;
+            if (delivery?.delivered) return shot.shot_id + " 已人工通过。成片已生成，可以在“人工预览”中播放。";
+            const reasons = (delivery?.issues || []).map(issue => typeof issue === "string" ? issue :
+              [issue.shot_id,issue.reason || issue.criterion_id].filter(Boolean).join(" · ")).filter(Boolean);
+            return shot.shot_id + " 已人工通过。" + (reasons.length ? "整片待交付：" + reasons.join("；") : "等待其余镜头及衔接验收。");
+          }, {refreshOnError:true});
+        if (view.shotReviews?.requestId === body.request_id && state.projectId===id) await studioReadShotReviews(id,body.request_id);
+      }, {small:true,primary:true,disabled:view.pending || view.loading});
+      if (!retry) approve.setAttribute("aria-label","人工通过 " + shot.shot_id + " 当前视频版本");
+      selectedCard.append(approve);
+    }
+    panel.append(entry);
+  }
+  return panel;
+}
 function studioVideo(data, catalog, view) {
   const box = node("div", "studio-inspector");
   const production = studioProduction(data);
@@ -991,6 +1209,33 @@ function studioVideo(data, catalog, view) {
   box.append(studioSection("视频制作委托"));
   const monitor=studioCurrentMonitor(state.projectId,view);
   if (monitor) { box.append(monitor.element); void monitor.refresh(); }
+  let openedReview=false;
+  if (data.video_execution?.commission_id) {
+    const commission = data.video_execution.commission_id;
+    const read = view.shotReviews?.requestId === commission ? view.shotReviews : null;
+    const execution=data.video_execution;
+    if (!read && execution.usage?.reserved_video_generations>0 && ["failed","interrupted","succeeded"].includes(execution.last_execution?.status || execution.status)) {
+      queueMicrotask(() => {
+        if (state.projectId===data.project_id && currentPhase()==="video" && view.data?.video_execution?.commission_id===commission &&
+            view.shotReviews?.requestId!==commission) void studioReadShotReviews(data.project_id,commission);
+      });
+    }
+    box.append(button(read?.loading?"正在读取拍摄版本…":read?.result?"刷新拍摄版本与验收报告":"查看全部拍摄版本与验收报告",
+      () => studioReadShotReviews(data.project_id,commission),{quiet:true,disabled:read?.loading || view.pending}));
+    if (read?.error) {
+      const issue = node("section","panel studio-shot-approvals");
+      issue.dataset.requestId=commission; issue.tabIndex=-1;
+      issue.append(note(read.error,true));
+      box.append(issue);
+    }
+    if (read?.result?.delivered) box.append(button("预览成片",()=>setStep("review"),{primary:true}));
+    if (read?.result && (!read.result.delivered || read.result.shots?.length)) {
+      box.append(studioShotApprovals(read.result,data.project_id,view,true));
+      openedReview=true;
+    }
+  }
+  if (!openedReview) append(box,studioShotApprovals(data.incomplete_production,state.projectId,view));
+  if (data.preview_gate?.ready) box.append(button("预览成片",()=>setStep("review"),{primary:true}));
   if (catalog.pending_script_ref) box.append(note("剧本 " + catalog.pending_script_ref.revision_id + " 已发布。当前分镜对应 "
     + (catalog.script_ref?.revision_id || "原工程") + "，等待新版制作规格后可委托。", true));
   box.append(studioVideoPlan(data,catalog,view));
@@ -1050,7 +1295,7 @@ function studioReview(data, catalog, internal=false) {
     box.append(studioRows([["已有素材", partial.available_count + " / " + partial.total + " 个镜头"],
       ["自动验收", partial.reviewed_count + " / " + partial.available_count + " 个已有镜头已出结论"],
       ["参考与视频内容检查", (partial.content_reviewed_count || 0) + " / " + partial.available_count + " 个镜头已有内容报告"],
-      ["剩余制作", partial.missing_shots.join("、") || "无"], ["制作状态", ready ? "验收已通过 · 可人工预览" : "自动验收与修复尚未完成"]]));
+      ["剩余制作", partial.missing_shots.join("、") || "无"], ["制作状态", ready ? "验收已通过 · 可人工预览" : "等待镜头及衔接通过"]]));
     const reviewJob = partial.review_jobs?.find(job=>ACTIVE.has(job.status));
     if (reviewJob) box.append(note(reviewJob.message || "正在自动验收已有镜头，结论将逐个更新。"));
     if (partial.autonomy?.version) {
@@ -1087,13 +1332,15 @@ function studioReview(data, catalog, internal=false) {
         const family={timed_action_beats:"动作时间编排",blocking_and_paths:"人物走位与路径",camera_and_visibility:"机位与动作可见性",reference_composition:"参考素材组织"}[design.strategy_family] || "新拍摄方案";
         row.append(node("p","",family + "：" + design.change_from_previous));
       }
+      if (repair.retake_failure) row.append(note(repair.retake_failure,true));
       const trace=studioTrace(repair.trace_id,"本轮修复 Trace ↗");if(trace)row.append(trace);box.append(row);
     }
     for (const shot of partial.shots) {
       const card = node("details", "studio-delivery"); card.open = shot.shot_id === (selectedShot()?.id || partial.shots[0]?.shot_id);
       card.append(node("summary", "", shot.shot_id + " · " + (shot.review_status === "completed" ?
         ({PASS:"自动验收通过",FAIL:"自动验收未通过",UNKNOWN:"自动验收待补证据"}[shot.status] || shot.status) : "等待自动验收") +
-        (shot.review_status === "completed" ? (shot.human_confirmed ? " · 已确认已阅" : ready ? " · 可人工预览" : " · Agent 待处理") : "")));
+        (shot.human_approved ? " · 已人工通过" : "") +
+        (shot.review_status === "completed" ? (shot.human_confirmed ? " · 已确认已阅" : ready ? " · 可人工预览" : shot.can_approve ? " · 可人工审看" : shot.human_approved ? "" : " · Agent 待处理") : "")));
       if (ready && assetUrl(shot.preview_url)) card.append(player(assetUrl(shot.preview_url), shot.shot_id + " 已有视频"));
       if (shot.report) {
         card.append(renderReport({...shot.report, report_url:shot.report_url,
@@ -1137,6 +1384,10 @@ function studioReview(data, catalog, internal=false) {
       const detail = node("div", "studio-check");
       append(detail, node("strong","",check.name), pill(check.status), node("p","",typeof check.detail === "object" ? JSON.stringify(check.detail) : check.detail), node("code","",check.path));
       const links = node("div","studio-actions");
+      if (check.human_approval) {
+        detail.append(pill("PASS","已人工通过"));
+        append(links,studioTrace(check.human_approval.trace_id,"人工通过 Trace ↗"));
+      }
       if (assetUrl(check.url)) links.append(studioLink(assetUrl(check.url),"查看检查报告 ↗"));
       if (assetUrl(check.clip_url)) links.append(studioLink(assetUrl(check.clip_url),"播放衔接片段 ↗"));
       append(links,studioTrace(check.trace_id,"复查 Trace ↗")); detail.append(links); details.append(detail);
@@ -1215,7 +1466,9 @@ function renderStudio() {
   const evidence = data.projection==="video" ? null : studioEvidence(data,view.section);
   if (evidence && detail.firstElementChild) detail.firstElementChild.after(evidence); else if (evidence) detail.append(evidence);
   panel.append(detail);
-  if (view.pending || view.message) {
+  const feedbackInPlan = view.section==="video" && view.continuationReceipt?.commissionId &&
+    view.continuationReceipt.commissionId===data.video_execution?.commission_id;
+  if ((view.pending || view.message) && !feedbackInPlan) {
     const message = node("div","studio-feedback"); message.setAttribute("role","status");
     append(message,node("p","",view.pending ? "正在保存…" : view.message),studioTrace(view.lastTrace)); panel.append(message);
   }

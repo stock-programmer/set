@@ -42,21 +42,21 @@ class AutonomyTests(unittest.TestCase):
         self.assertTrue(stop["allowed"])
         self.assertTrue(stop["blocked"]);self.assertTrue(stop["exhausted"])
 
-    def test_subtitle_can_use_local_edit_budget_after_video_repair_budget_is_exhausted(self):
+    def test_failed_subtitle_stops_after_one_retake_even_with_other_shots_budget(self):
         record=self.configure();self.report("S001","PASS");r=self.report("S002","PASS")
         r["results"].append({"criterion_id":"script_subtitle","required":True,"status":"FAIL",
             "reason":"离线模拟：全片已审看但未显示固定剧本字幕。","execution_status":"executed"})
         _write(self.w.reports["S002"]["report_path"],r);self.w.reports["S002"]["report_sha256"]=digest_json(r)
-        record.update(video_generations=4,repair_reservations={"S002":2})
+        record.update(video_generations=2,repair_reservations={"S002":1})
         queue=self.w.autonomy.queue(record)
-        self.assertEqual([(row["shot_id"],row["repair_method"]) for row in queue["actionable"]],[("S002","edit_shot_asset")])
-        self.assertFalse(self.w.stop_check(record)["allowed"])
-        self.w.repair.local_edits["S002"]=2
-        self.assertFalse(self.w.autonomy.queue(record)["actionable"])
-        self.assertTrue(any(row["blocker_kind"]=="local_edit_limit" for row in self.w.autonomy.queue(record)["exhausted"]))
+        self.assertFalse(queue["actionable"])
+        self.assertIn("script_subtitle [FAIL]", queue["terminal_summary"])
+        self.assertIn(r["results"][-1]["reason"], queue["terminal_summary"])
+        self.assertTrue(self.w.stop_check(record)["allowed"])
 
     def test_same_failed_local_edit_is_rejected_before_another_media_operation(self):
         self.configure();self.report("S001","FAIL")
+        self.w.shooting_plan = None  # exercise the standalone local edit tool
         plan=self.w.repair.prepare("S001",["action_sequence"],"offline local black tail repair plan","offline actual evidence")
         lineage={"operation":{"name":"black_tail","start_s":4.0,"subtitle":""}}
         path=self.root/"prior-local-lineage.json";_write(path,lineage)
@@ -78,6 +78,7 @@ class AutonomyTests(unittest.TestCase):
 
     def test_approved_caption_terminal_punctuation_does_not_require_changing_frozen_script(self):
         self.configure();self.report("S001","FAIL");self.w.script={"offline":"离线字幕"}
+        self.w.shooting_plan = None
         plan=self.w.repair.prepare("S001",["action_sequence"],"offline approved subtitle punctuation repair","offline evidence")
         with patch("pianchang.acceptance.required_subtitle",return_value={"expected_text":"离线字幕。"}),\
              patch("pianchang.video_collab_agent._validated_media",side_effect=ValueError("offline source gate reached")) as gate:
@@ -319,6 +320,49 @@ class AutonomyTests(unittest.TestCase):
         self.assertEqual(record["video_generations"],1)
         self.assertEqual(record["repair_reservations"],{"S001":1})
         self.assertEqual(self.w.repair.history[0]["status"],"reviewed")
+
+    def test_rejected_submission_keeps_original_candidate_and_upgrades_unknown_history(self):
+        from dataclasses import replace
+        from pianchang.bailian_video import build_request, VideoError
+        from pianchang.video_agent import VideoRunner
+        from tests.test_video_agent import FakeClient
+        record = self.recovery_fixture(False)
+        sid = "S001"
+        history = self.w.repair.history[0]
+        plan = self.w.repair.plans[history["repair_id"]]
+        metadata = {"execution_key":self.w.operation_key(sid, plan), "shot_id":sid,
+                    "script_asset_ref":self.w.ref, "dependency_sha256":"d"*64}
+        client = FakeClient(submit_error=VideoError("test provider denial", http_status=400, request_id="req"))
+        runner = VideoRunner(replace(self.w.video_config, api_key="offline-only"), client)
+        payload = build_request(runner.config, "offline rejection")
+        with self.assertRaises(VideoError):
+            runner.submit(payload, metadata)
+        self.assertEqual(len(client.submissions), 1)
+        original = copy.deepcopy(self.w.shots)
+        wire = {"status":"MATCHED_RESPONSE", "http_status":400, "provider_error":{"code":"InvalidParameter"}}
+        with patch("pianchang.video_collab_agent._validated_media"), patch("pianchang.video_agent.VideoRunner.resume") as poll, \
+             patch("pianchang.video_agent.VideoRunner.submit") as post, patch("pianchang.reference_usage.verify_reference_exchange") as exchange:
+            # An uncorrelated response still has to remain unknown.
+            exchange.return_value = {"status":"RESPONSE_UNCORRELATED"}
+            self.w.autonomy.recover(record)
+            self.assertEqual(self.w.repair.history[0]["status"], "blocked_unconfirmed_submission")
+            exchange.return_value = wire
+            record.pop("pending_tool")
+            recovered = self.w.autonomy.recover(record)
+            self.assertEqual(recovered["outcomes"][0]["status"], "submission_rejected")
+            evidence = self.w.autonomy.blocked[sid]
+            self.assertEqual(evidence["provider_request_id"], "req")
+            self.assertEqual(evidence["http_status"], 400)
+            self.assertEqual(self.w.repair.history[0]["previous_reconciliation"]["status"], "blocked_unconfirmed_submission")
+            queue = self.w.autonomy.queue(record)
+            self.assertTrue(any(row.get("blocker_kind") == "submission_rejected" for row in queue["blocked"]))
+            self.assertTrue(any(row["shot_id"] == "S002" for row in queue["actionable"]))
+            with self.assertRaisesRegex(ValueError, "InvalidParameter"):
+                self.w.require_reference_inputs(sid)
+            self.assertEqual(self.w.shots, original)
+            self.assertEqual(record["video_generations"], 1)
+            post.assert_not_called()
+            poll.assert_not_called()
 
     def test_generated_candidate_with_only_technical_checks_gets_real_content_review_without_submission(self):
         self.configure();old=self.report("S001","PASS")

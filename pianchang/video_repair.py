@@ -158,14 +158,45 @@ def _subtitle_font():
     return font
 
 
+def retake_limit(policy, shot_id):
+    """The current ceiling also applies to previously frozen orders."""
+    if shot_id in policy.get("previously_retried_shots", ()):
+        return 0
+    return min(1, policy.get("max_repairs_per_shot", 1))
+
+
+def authorized_video_count(plan):
+    policy = plan.get("acceptance_loop") or {}
+    first_pass = len(plan["new_shots"]) + len(plan["retake_shots"])
+    total = first_pass + sum(retake_limit(policy, sid) for sid in policy.get("shot_ids", ()))
+    cap = plan.get("generation_request_limit", total)
+    if type(cap) is not int or cap < first_pass:
+        raise ValueError("生成任务数量超过了本次委托的总请求上限。")
+    return min(total, cap)
+
+
+def failed_retake_issues(history):
+    summary = history["result_report"]
+    report = json.loads(Path(summary["report_path"]).read_bytes())
+    if (digest_json(report) != summary["report_sha256"]
+            or report["media_sha256"] != history["result_clip"]["media_sha256"]):
+        raise ValueError("重拍验收报告与实际候选不符。")
+    return [{k: row[k] for k in ("criterion_id", "status", "reason")}
+            for row in report["results"] if row.get("required") and row["status"] != "PASS"]
+
+
 @traced("video.repair.policy", kind="validation", capture_inputs=False)
-def acceptance_policy(shot_ids, *, repairs_per_shot=2):
-    if not _check("repair_policy.repairs_per_shot", True, type(repairs_per_shot) is int and 0 <= repairs_per_shot <= 6):
-        raise ValueError("每镜头自动重拍上限须为 0～6。")
-    return {"version": POLICY_VERSION, "shot_ids": list(shot_ids),
+def acceptance_policy(shot_ids, *, repairs_per_shot=1, previously_retried_shots=()):
+    if not _check("repair_policy.repairs_per_shot", True, type(repairs_per_shot) is int and 0 <= repairs_per_shot <= 1):
+        raise ValueError("每镜头自动重拍上限须为 0 或 1。")
+    policy = {"version": POLICY_VERSION, "shot_ids": list(shot_ids),
             "autonomy_version": "video-autonomy/1",
-            "max_repairs_per_shot": repairs_per_shot, "max_local_edits_per_shot": 2,
+            "max_repairs_per_shot": repairs_per_shot, "max_local_edits_per_shot": 0,
             "completion_requires": "all_required_checks_pass"}
+    carried = sorted(set(previously_retried_shots).intersection(policy["shot_ids"]))
+    if carried:
+        policy["previously_retried_shots"] = carried
+    return policy
 
 
 def _schema(properties=None, required=None):
@@ -205,14 +236,45 @@ class VideoRepair:
         _write(self.w.directory / "repair-history.json", {"version": POLICY_VERSION,
                "history": self.history, "plans": self.plans})
 
+    def retake_spent(self, shot_id):
+        policy = (self.w.shooting_plan or {}).get("acceptance_loop") or {}
+        inherited = (self.w.partial or {}).get("previously_retried_shots", ())
+        return shot_id in inherited or retake_limit(policy, shot_id) == 0 or any(
+            h["shot_id"] == shot_id and h.get("strategy") == "prompt_and_locked_references"
+            and h.get("status") != "local_failure_before_post" for h in self.history)
+
+    def require_retake_available(self, shot_id):
+        if self.retake_spent(shot_id):
+            raise ValueError(f"{shot_id} 的自动重拍额度已用完，已停止重拍，等待人工审看。")
+
+    def report_retake_failure(self, history):
+        if history.get("strategy") != "prompt_and_locked_references" or not history.get("result_report"):
+            return
+        summary = history["result_report"]
+        if history.get("retake_failure", {}).get("report_sha256") == summary["report_sha256"]:
+            return
+        issues = failed_retake_issues(history)
+        if not issues:
+            return
+        lines = [f'{row["criterion_id"]} [{row["status"]}] {row["reason"]}' for row in issues]
+        message = "\n".join([f'{history["shot_id"]} 重拍后验收仍未通过，已停止自动重拍。', *lines])
+        failure = {"report_sha256": summary["report_sha256"], "issues": issues, "summary": message}
+        event("video.repair.retake_limit_reached", {"shot_id": history["shot_id"], **failure}, kind="decision")
+        history["retake_failure"] = failure
+        self._paths()
+        print(message, file=sys.stderr, flush=True)
+        self.w._progress(message)
+
     def _rows(self):
         from pianchang.video_collab_agent import _read
+        from pianchang.creative_sound import effective_results
         rows = []
         for sid, summary in self.w.reports.items():
             report = _read(summary["report_path"])
             if digest_json(report) != summary["report_sha256"] or report["media_sha256"] != self.w.shots[sid]["media_sha256"]:
                 raise ValueError("验收报告与当前候选不符：" + sid)
-            for row in report["results"]:
+            shot = next(s for s in self.w.project["shots"] if s["id"] == sid)
+            for row in effective_results(shot, report):
                 if row.get("required") and row["status"] != "PASS":
                     rows.append({"shot_id": sid, "report_sha256": summary["report_sha256"], **row})
         return rows
@@ -257,6 +319,7 @@ class VideoRepair:
     @traced("video.repair.prepare", kind="tool", capture_inputs=False)
     def prepare(self, shot_id, criterion_ids, instruction, reason):
         from pianchang.video_collab_agent import _write
+        self.require_retake_available(shot_id)
         failed = self.w.failed_shots.get(shot_id)
         if (shot_id not in self.w.shots and not failed) or len(set(criterion_ids)) != len(criterion_ids):
             raise ValueError("修复必须绑定一个已就绪候选及不重复的验收项。")
@@ -270,7 +333,9 @@ class VideoRepair:
         if not _check("repair.unresolved_criteria", sorted(criterion_ids), sorted(r["criterion_id"] for r in rows)):
             raise ValueError("只能针对当前报告中尚未通过的实际验收项修复。")
         if any(r["criterion_id"] in {"evidence_integrity", "candidate_binding", "reference_submission"}
-               or r.get("execution_status") in {"blocked_missing_media", "execution_error", "evidence_invalid", "not_run"}
+               or r.get("execution_status") in {"blocked_missing_media", "blocked_missing_cut_window",
+                                                "execution_error", "evidence_invalid", "not_run"}
+               or r.get("creative_audio_policy") and r["status"] != "FAIL"
                for r in rows):
             raise ValueError("请先补齐缺失镜头或恢复检查/素材绑定；不能以重拍掩盖证据或执行错误。")
         plan = {"shot_id": shot_id, "candidate_sha256": self.w.shots.get(shot_id, {}).get("media_sha256"),
@@ -294,6 +359,13 @@ class VideoRepair:
                    "project_sha256":digest_json(self.w.project)}
         if not all([_check("repair."+k, plan[k], actual) for k, actual in binding.items()]):
             raise ValueError("候选或验收已改变，须读取当前证据后重新准备修复。")
+        if self.w.reports.get(shot_id):
+            from pianchang.creative_sound import legacy_audio_checks
+            from pianchang.video_collab_agent import _read
+            shot = next(s for s in self.w.project["shots"] if s["id"] == shot_id)
+            report = _read(self.w.reports[shot_id]["report_path"])
+            if legacy_audio_checks(shot, report).intersection(plan["criterion_ids"]):
+                raise ValueError("旧修复依据缺少对应分镜的原声检查，须先重验原素材。")
         for history in self.history:
             if history["repair_id"] != repair_id:
                 continue
@@ -319,6 +391,7 @@ class VideoRepair:
 
     @traced("video.repair.preflight", kind="validation", capture_inputs=False)
     def preflight(self, shot_id, repair_id):
+        self.require_retake_available(shot_id)
         self.w.require_reference_inputs(shot_id)
         from pianchang.video_agent import compile_shot
         from pianchang.bailian_video import build_request
@@ -387,6 +460,7 @@ class VideoRepair:
     def assess_candidate(self, history):
         """Never silently replace already-passed core content with a regressing candidate."""
         from pianchang.video_collab_agent import _read,_write,_validated_media
+        self.report_retake_failure(history)
         if not getattr(self.w,"autonomy",None):
             return {"status":"candidate_reviewed","reason":"沿用原非自主任务的候选策略。"}
         source,old_summary=history.get("source_clip"),history.get("source_report")
@@ -523,6 +597,7 @@ class VideoRepair:
     @traced("video.repair.regenerate", kind="tool", capture_inputs=False)
     def regenerate(self, shot_id, repair_id):
         plan = self._plan(shot_id, repair_id)
+        self.require_retake_available(shot_id)
         self.validate_generation_strategy(shot_id, plan["instruction"])
         history = self._start(plan, "prompt_and_locked_references")
         result = self.w.generate(shot_id, repair=plan)
@@ -554,7 +629,9 @@ class VideoRepair:
             raise ValueError("字幕文字须来自固定剧本，句末标点只允许已批准镜头中的原样形式，切黑时间须有效。")
         if required and subtitle!=required["expected_text"]:
             raise ValueError("本镜头的必过字幕必须完整烧录，不能省略文字或标点："+required["expected_text"])
-        limit = (self.w.shooting_plan or {}).get("acceptance_loop", {}).get("max_local_edits_per_shot", 2)
+        if self.retake_spent(shot_id) or (self.w.shooting_plan or {}).get("acceptance_loop"):
+            raise ValueError("本次自动验收最多重拍一次，不追加本地修改和复验。")
+        limit = 2
         if self.local_edits.get(shot_id, 0) >= limit:
             raise ValueError("本镜头本地修复次数已到上限，任务仍未完成。")
         source = self.w.shots[shot_id]

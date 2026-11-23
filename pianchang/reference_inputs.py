@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import threading
 from pathlib import Path
 
 from pianchang.agent_loop import Tool
@@ -22,6 +23,7 @@ from trace_system import TraceError, current_context, event, get_tracer, traced
 
 VERSION="reference-inputs/1"
 STRATEGIES=("identity_first","balanced_boards")
+_external_review_lock = threading.Lock()
 
 
 def _ref(asset):return {k:asset[k] for k in ("asset_id","revision_id","sha256")}
@@ -35,16 +37,24 @@ def external_review_usage(directory):
 
 
 @traced("references.inputs.reserve_external_review",kind="validation",capture_inputs=False)
-def reserve_external_review(directory,model_limit):
-    directory=Path(directory);usage=external_review_usage(directory)
+def reserve_external_review(directory,model_limit,*,purpose="reference_input_review"):
+    with _external_review_lock:
+        _reserve_external_review(Path(directory), model_limit, purpose)
+
+
+def _reserve_external_review(directory, model_limit, purpose):
+    from pi_bridge.recovery import strategy_external_usage
+    usage=external_review_usage(directory)
     checkpoint=directory.parent/"agent/run.json"
     steps=json.loads(checkpoint.read_text("utf-8")).get("steps",0) if checkpoint.is_file() else 0
-    count=steps+len(usage["reservations"])
+    strategy_calls=strategy_external_usage(directory.parent)
+    count=steps+strategy_calls+len(usage["reservations"])
     valid=type(model_limit) is int and count<model_limit
     event("references.inputs.frozen_model_budget",{"path":"commission.max_model_calls","expected":model_limit,
-        "actual":{"existing_production_calls":steps,"external_review_reservations":len(usage["reservations"])},"status":"PASS" if valid else "FAIL"},kind="validation")
+        "actual":{"existing_production_calls":steps,"external_strategy_calls":strategy_calls,
+                  "external_review_reservations":len(usage["reservations"])},"status":"PASS" if valid else "FAIL"},kind="validation")
     if not valid:raise ValueError("原冻结制作委托的模型调用额度不足或未登记，不能新增视觉核验。")
-    usage["reservations"].append({"context":current_context(),"purpose":"reference_input_review"})
+    usage["reservations"].append({"context":current_context(),"purpose":purpose})
     persist_inputs(directory/"review-reservations.json",usage)
 
 

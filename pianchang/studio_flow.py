@@ -41,16 +41,18 @@ def studio_video_detail(service, pid):
     view = studio_project_for_video(service, pid, include_delivery=True)
     project = view["project"]
     delivery = view.pop("published_delivery")
-    fields = ("id", "kind", "project_id", "run_id", "message_id", "commission_id",
+    fields = ("id", "kind", "project_id", "run_id", "message_id", "commission_id", "commission_job_id",
               "status", "created_at", "updated_at", "message", "trace_id", "shot_id", "story_job_id",
               "plan_id", "cancel_requested")
     jobs = []
+    source_jobs = []
     with service.lock:
         for job in service.state["jobs"]:
             result = job.get("result") or {}
             project_id = job.get("project_id") or (result.get("project_id") if isinstance(result, dict) else None)
             if project_id != pid:
                 continue
+            source_jobs.append({**job, "project_id":pid})
             row = {key: job[key] for key in fields if key in job}
             row["project_id"] = pid
             error = job.get("error")
@@ -64,10 +66,12 @@ def studio_video_detail(service, pid):
                 proposal = result.get("extra_retake")
                 if isinstance(proposal, dict) and proposal.get("proposal_id"):
                     summary["extra_retake"] = {"proposal_id": proposal["proposal_id"]}
+                    if job.get("message_id") and isinstance(proposal.get("partial"),dict) and proposal["partial"].get("request_id")==job["message_id"]:
+                        summary["extra_retake"]["partial"] = {"request_id":job["message_id"]}
                 if summary:
                     row["result"] = summary
             jobs.append(row)
-    execution = current_commission(service, pid, view=view, jobs=jobs)
+    execution = current_commission(service, pid, view=view, jobs=source_jobs)
     plan, error = None, None
     if not execution["commission_id"]:
         from pianchang.studio_jobs import studio_video_plan
@@ -183,6 +187,7 @@ def _delivery(service, package, folder, orders, pid=None):
                       "url": _artifact(service, clip["media_path"], clip["media_sha256"],pid),
                       "actual_refs": clip.get("submitted_refs"), "receipt_status": (clip.get("reference_receipt") or {}).get("status")})
     checks = [{"name": sid + " 镜头验收", "status": report["status"], "path": report["report_path"],
+               "human_approval": (data.get("manual_approvals") or {}).get(sid),
                "url": _artifact(service, report["report_path"], report.get("report_sha256")),
                "detail": "待核对 " + "、".join(report["unresolved"]) if report["unresolved"] else "已完成记录中的检查"}
               for sid, report in data["reports"].items()]
@@ -291,7 +296,8 @@ def studio_flow(service, pid, *, denied_gate=None, jobs=None):
     preview_ready=access["ready"]
     preview_gate = {**{k:v for k,v in access.items() if k not in {"allowed_media","preview"}},
                     "reviewed_count": (reviewed or {}).get("reviewed_count", 0),
-                    "passed_count": sum(s.get("status") == "PASS" for s in (reviewed or {}).get("shots", [])),
+                    "passed_count": sum(s.get("status") == "PASS" or s.get("human_approved") is True
+                                        for s in (reviewed or {}).get("shots", [])),
                     "total": len(project["shots"])}
     for production in productions:
         if not preview_ready or production["revision_id"]!=catalog.get("production_ref",{}).get("revision_id"):
@@ -299,7 +305,10 @@ def studio_flow(service, pid, *, denied_gate=None, jobs=None):
             for shot in production["shots"]:shot["url"]=None
     if not preview_ready:
         for review in (partial_review,delivery_review):
-            for shot in (review or {}).get("shots",[]):shot["preview_url"]=None
+            for shot in (review or {}).get("shots",[]):
+                if not (review is partial_review and (shot.get("can_approve") or shot.get("human_approved"))
+                        and (shot.get("preview_url") or "").startswith(f"/api/projects/{pid}/studio/progress/media?")):
+                    shot["preview_url"] = None
     return {"project_id": pid, "title": title, "story_id": catalog["story_id"], "run_id": catalog["run_id"],
             "project_path": catalog["project_path"], "script": script, "assets": catalog, "productions": productions,
             "asset_work": work, "video_plan": video_plan, "video_plan_error": plan_error, "video_execution":execution,"incomplete_production": partial_review,

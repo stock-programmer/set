@@ -23,6 +23,7 @@ class RepairTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.tracer = Tracer(self.root / "traces")
+        self.enterContext(self.tracer.storage_session())
         self.binding = use_context(None, tracer=self.tracer)
         self.binding.__enter__()
         self.addCleanup(self.binding.__exit__, None, None, None)
@@ -59,6 +60,29 @@ class RepairTests(unittest.TestCase):
                 result = self.w.review_and_export()
                 self.assertIsNone(result["preview"])
                 export.assert_not_called()
+
+    def test_mixed_audio_requires_bound_failure_before_a_retake(self):
+        from pianchang.creative_sound import POLICY
+        self.project["shots"][0]["description"] = "屏幕行情跳动，财经主播播报市场下跌。"
+        report = self.report("S001", "FAIL")
+        report["content_review_version"] = "grounded-video-review/2"
+        summary = self.w.reports["S001"]
+        def save(status, **fields):
+            report["results"][0].update(status=status, **fields)
+            _write(Path(summary["report_path"]), report)
+            summary["report_sha256"] = digest_json(report)
+        save("FAIL")
+        issue = next(i for i in self.w.acceptance_gate(validate=False)["issues"] if i["shot_id"] == "S001")
+        self.assertTrue(issue["needs_creative_audio"])
+        self.assertEqual(issue["status"], "UNKNOWN")
+        for verified in (False, True):
+            if verified:
+                save("UNKNOWN", creative_audio_policy=POLICY, execution_status="inconclusive")
+            with self.assertRaisesRegex(ValueError, "先补齐"):
+                self.w.repair.prepare("S001", ["action_sequence"], "offline retake direction", "offline evidence")
+        save("FAIL", execution_status="executed")
+        plan = self.w.repair.prepare("S001", ["action_sequence"], "offline retake direction", "bound visual failure")
+        self.assertEqual(plan["criterion_ids"], ["action_sequence"])
 
     def test_repair_is_bound_to_real_unresolved_rows_and_stale_candidates_are_rejected(self):
         self.report("S001")
@@ -131,7 +155,8 @@ class RepairTests(unittest.TestCase):
         source={"prior_continuation":None,"mode":"offline provenance fixture"};sha=digest_json(source)
         _write(earlier/("resume-"+sha[:16]+".json"),{"source":source,"project":self.project})
         _write(earlier/"reports.json",{"S001":original});_write(recent/"reports.json",{})
-        clip={"shot_id":"S001","media_sha256":"a"*64,"dependency_sha256":"d"*64,"script_ref":self.w.ref}
+        clip={"shot_id":"S001","media_sha256":"a"*64,"dependency_sha256":"d"*64,
+              "generation_job_sha256":"c"*64,"script_ref":self.w.ref}
         self.w.partial={"script_ref":self.w.ref,"shots":{"S001":clip},"source":{"prior_continuation":{"request_id":"2"*32,"sha256":sha}}}
         self.w.shooting_plan={"continuation":{"request_id":"1"*32,"sha256":"c"*64}}
         self.w.impact={"reuse":["S001"],"shots":{"S001":{"target":{"sha256":"d"*64}}}}
@@ -225,14 +250,26 @@ class RepairTests(unittest.TestCase):
     def test_native_pi_sdk_repairs_and_respects_the_same_export_gate(self):
         self._exercise_model_repair(native_pi=True)
 
-    def _exercise_model_repair(self,native_pi=False):
-        diagnostic=self.root/"offline-diagnostic.mp4"
+    def test_failed_retake_stops_both_runtimes_with_the_second_verdict(self):
+        import io
+        from contextlib import redirect_stderr
+        for native in (False, True):
+            with self.subTest(native_pi=native), redirect_stderr(io.StringIO()) as console:
+                self._exercise_model_repair(native_pi=native, retry_passes=False)
+                self.assertIn("offline second verdict", console.getvalue())
+
+    def _exercise_model_repair(self,native_pi=False,retry_passes=True):
+        from tempfile import TemporaryDirectory
+        temp = TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        diagnostic=root/"offline-diagnostic.mp4"
         subprocess.run([str(find_ffmpeg()),"-nostdin","-v","error","-f","lavfi","-i",
                         "color=c=blue:s=160x240:r=10:d=1","-c:v","libx264",str(diagnostic)],check=True)
-        original=self.root/"offline-initial.mp4"
+        original=root/"offline-initial.mp4"
         subprocess.run([str(find_ffmpeg()),"-nostdin","-v","error","-f","lavfi","-i",
                         "color=c=red:s=160x240:r=10:d=1","-c:v","libx264",str(original)],check=True)
-        submissions=[];root=self.root;mode={"repaired":False};old_reports={}
+        submissions=[];mode={"repaired":False};old_reports={}
         class Runner:
             def __init__(self,config):pass
             def submit(self,request,metadata):
@@ -249,12 +286,12 @@ class RepairTests(unittest.TestCase):
             clip=w.shots[sid];folder=w.directory/"mock-reports"/(sid+("-repair" if clip.get("repair_id") else "-initial"))
             inspection=inspect_media(clip["media_path"],folder/"inspection",interval_s=1,max_frames=3)
             contract=create_contract(w.project,sid,width=160,height=240)
-            status="PASS" if sid!="S001" or mode["repaired"] else "FAIL"
+            status="PASS" if sid!="S001" or mode["repaired"] and retry_passes else "FAIL"
             report={"schema_version":"offline-mock-report/1","shot_id":sid,"status":status,"task_complete":status=="PASS",
                     "project_sha256":digest_json(w.project),"media_sha256":clip["media_sha256"],"inspection_sha256":digest_json(inspection),
                     "results":[{"criterion_id":r["criterion_id"],"required":r["required"],
                                 "status":status if r["criterion_id"]=="action_sequence" else "PASS",
-                                "reason":"explicit offline mocked semantic verdict"} for r in contract["requirements"]]}
+                                "reason":"offline second verdict" if clip.get("repair_id") else "offline first verdict"} for r in contract["requirements"]]}
             _write(folder/"contract.json",contract);_write(folder/"report.json",report)
             if sid=="S001" and not mode["repaired"]:old_reports[str(folder/"report.json")]=digest_json(report)
             return {"shot_id":sid,"status":status,"media_accepted":status=="PASS","report_path":str(folder/"report.json"),
@@ -302,21 +339,26 @@ class RepairTests(unittest.TestCase):
                     "usage":{"prompt_tokens":10,"completion_tokens":10,"total_tokens":20}}
             model.pi_exchange=exchange
         with patch("pianchang.video_collab_agent.VideoRunner",Runner),patch.object(VideoWorkspace,"_review",offline_review):
-            result=run_video_agent(script=self.script,script_ref=self.w.ref,directory=self.root/"production",text_config=None,
+            result=run_video_agent(script=self.script,script_ref=self.w.ref,directory=root/"production",text_config=None,
                 video_config=VideoConfig(),template_project=self.project,client=model,shooting_plan=plan,max_video_generations=6)
         if native_pi:
             self.assertEqual(result["loop"]["backend"],"pi")
-            messages=[json.loads(m["content"]) for m in _read(self.root/"production/agent/run.json")["messages"]]
+            messages=[json.loads(m["content"]) for m in _read(root/"production/agent/run.json")["messages"]]
             errors=[m.get("error") for m in messages if m.get("ok") is False]
         else:
-            journal=[json.loads(x) for x in (self.root/"production/agent/events.jsonl").read_text(encoding="utf8").splitlines()]
+            journal=[json.loads(x) for x in (root/"production/agent/events.jsonl").read_text(encoding="utf8").splitlines()]
             errors=[e["data"].get("error") for e in journal if e["name"]=="tool_result" and not e["data"].get("ok")]
-        self.assertTrue(result["loop"]["task_complete"],(result["loop"],errors))
-        self.assertTrue(result["production"]["media_accepted"])
         self.assertEqual(submissions,[("S001",False),("S002",False),("S003",False),("S001",True)])
         for path,sha in old_reports.items():self.assertEqual(digest_json(_read(path)),sha)
+        if not retry_passes:
+            self.assertEqual(result["loop"]["reason"], "acceptance_retake_limit", (result["loop"], errors))
+            self.assertIn("offline second verdict", result["loop"]["summary"])
+            self.assertIsNone(result["production"])
+            return
+        self.assertTrue(result["loop"]["task_complete"],(result["loop"],errors))
+        self.assertTrue(result["production"]["media_accepted"])
         self.assertTrue(Path(result["production"]["preview"]["preview_path"]).is_file())
-        self.assertTrue(self.tracer.verify(_read(self.root/"production/agent/run.json")["trace_context"]["trace_id"])["ok"])
+        self.assertTrue(self.tracer.verify(_read(root/"production/agent/run.json")["trace_context"]["trace_id"])["ok"])
 
 
 if __name__ == "__main__":unittest.main()

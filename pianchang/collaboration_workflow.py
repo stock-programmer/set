@@ -46,6 +46,10 @@ def causal(message, relation):
     return {**message["trace_context"], "relation": relation}
 
 
+class VideoAgentStopped(ValueError):
+    """The production loop returned a persisted, incomplete result."""
+
+
 class Collaboration:
     def __init__(self, directory, run_id, *, env_file=None):
         if not re.fullmatch("[a-f0-9]{32}", run_id):
@@ -121,6 +125,10 @@ class Collaboration:
 
     @traced("collaboration.commission", kind="task")
     def commission(self, script, template, prior, video_budget, *, shooting_plan=None):
+        cap = template["content"].get("generation_request_limit") if template else None
+        if cap is not None and (shooting_plan is None or shooting_plan.get("generation_request_limit") != cap
+                                or type(video_budget) is not int or video_budget > cap):
+            raise ValueError("分组制作必须确认含总请求上限的拍摄计划。")
         payload = {"script": ref(script), "template": ref(template) if template else None,
                    "previous": ref(prior) if prior else None, "max_video_generations": video_budget,
                    "goal": "自主制作、验收并针对证据修复，所有镜头及衔接必过项通过后交付人工预览。"}
@@ -208,7 +216,10 @@ class Collaboration:
             carried = shot.get("partial_source")
             if carried and carried != request["payload"].get("shooting_plan", {}).get("partial"):
                 raise ValueError("部分制作素材来源与已批准的计划不符。")
-            if shot["operation"] == "reused" and (not carried or
+            continuation = shot.get("continuation_source")
+            if continuation and continuation != request["payload"].get("shooting_plan", {}).get("continuation"):
+                raise ValueError("恢复素材来源与已批准的计划不符。")
+            if shot["operation"] == "reused" and (not (carried or continuation) or
                     (old and open_ref(self.store, old)["content"]["media_sha256"] == shot["media_sha256"])):
                 asset = open_ref(self.store, old)
                 if asset["content"]["media_sha256"] != shot["media_sha256"]:
@@ -226,6 +237,8 @@ class Collaboration:
             checks[sid] = ref(evidence)
         package = {**production, "media_refs": bindings, "check_refs": checks}
         template = request.get("payload", {}).get("template")
+        if template and open_ref(self.store, template)["kind"] == "production_spec":
+            package["spec_ref"] = ref(template)
         template_dep = [dep(template, "production_input")] if template else []
         return self.store.publish_asset(self.story + "/production", package, kind="production",
             parent_revision=previous["revision_id"] if previous else None,
@@ -264,7 +277,21 @@ class Collaboration:
                 raise ValueError("先前云端任务的最终失败状态无法核实：" + sid)
         return checkpoint
 
-    def worker(self, request_id, *, resume=False):
+    def _decision_not_sent(self, request_id, record):
+        from tools.workbench_loop_observer import _trace
+        origin = record.get("trace_context") or {}
+        if (record.get("trace_incomplete") or not origin.get("trace_id") or not origin.get("span_id")
+                or (record.get("process_cleanup") or {}).get("confirmed_exit") is not True):
+            return False
+        evidence = _trace(self.env_file.parent, origin["trace_id"], origin["span_id"])
+        proof = evidence.get("planner_not_sent") or {}
+        if (not evidence["trace_failed"] and not evidence["outstanding"]
+                and proof.get("trace_id") == origin["trace_id"] and proof.get("run_span_id") == origin["span_id"]
+                and proof.get("commission_id") == request_id and proof.get("run_id") == self.run_id):
+            return proof
+        return None
+
+    def worker(self, request_id, *, resume=False, explicit_continuation=False):
         """Consume one addressed, immutable request. An already-claimed task is never replayed."""
         from pianchang.collab_negotiation import VideoNegotiation
         from pianchang.video_collab_agent import run_video_agent
@@ -287,15 +314,45 @@ class Collaboration:
                    links=links, attributes={"correlation_id": self.run_id, "revision": rev, "agent": "video"}) as root:
             request = self.store.claim("video", message_id=request_id)
             if request is None:
-                from pianchang.video_autonomy import recoverable_order
+                from pianchang.video_autonomy import (_can_resume_unprepared_pi_order, can_resume_planned_pi_order,
+                                                      can_prepare_reused_continuation, can_resume_paid_pi_order, recoverable_order)
                 status=incoming["deliveries"].get("video")
-                recoverable_block=status=="blocked" and recoverable_order(self.folder/("video-spec-"+request_id))
+                work = self.folder / ("video-spec-" + request_id)
+                recoverable_block = status == "blocked" and recoverable_order(work)
+                resume_reason = "existing_operation_reconciliation"
+                if resume and explicit_continuation and status in {"blocked", "accepted", "received", "unknown"}:
+                    run_path = work / "agent/run.json"
+                    if run_path.is_file():
+                        record = read_json(run_path)
+                        if (record.get("status") == "needs_input"
+                                and (record.get("result") or {}).get("reason") == "pi_stopped"):
+                            if record.get("video_generations") and not record["result"].get("completion_check"):
+                                proof = self._decision_not_sent(request_id, record)
+                                if not proof or not can_resume_paid_pi_order(work, args["shooting_plan"], record, proof,
+                                        request_id=request_id, run_id=self.run_id, script=args["script"],
+                                        output=load_config(self.env_file, allow_missing=True).output_dir,
+                                        limits=args.get("execution_limits")):
+                                    raise ValueError("已付款镜头、会话或冻结额度无法核对，须核实原任务")
+                                recoverable_block = True
+                                resume_reason = "paid_pi_decision_not_sent"
+                            elif status == "blocked" and not recoverable_block:
+                                if can_prepare_reused_continuation(work, args.get("shooting_plan"), record):
+                                    recoverable_block = True
+                                    resume_reason = "explicit_reused_continuation_preparation"
+                                elif _can_resume_unprepared_pi_order(work, args.get("shooting_plan"), record):
+                                    recoverable_block = True
+                                    resume_reason = "explicit_unprepared_pi_decision"
+                                elif (can_resume_planned_pi_order(work, args.get("shooting_plan"), record)
+                                      and self._decision_not_sent(request_id, record)):
+                                    recoverable_block = True
+                                    resume_reason = "planned_pi_decision_not_sent"
                 if (not resume or (status not in {"accepted","unknown","received"} and not recoverable_block)
                         or not args.get("shooting_plan",{}).get("acceptance_loop",{}).get("autonomy_version")):
                     raise ValueError("委托已被领取或处理，须核实原任务")
                 request = incoming
                 event("collaboration.resume_existing_order", {"request_id":request_id,
-                      "previous_status":incoming["deliveries"].get("video"),"budget_reset":False},kind="state")
+                      "previous_status":incoming["deliveries"].get("video"),"budget_reset":False,
+                      "reason":resume_reason},kind="state")
             try:
                 notice = self.store.claim("video", message_id=published["message_id"])
                 if notice:
@@ -357,7 +414,7 @@ class Collaboration:
                             self.store.send("production.result", sender="video", recipient="script", category="result",
                                 story_id=self.story, payload=payload, correlation_id=self.run_id, causation_id=request_id)
                             self.store.ack("video", request_id, "blocked", result=payload)
-                    raise ValueError("视频 Agent 停止：" + video["loop"]["summary"])
+                    raise VideoAgentStopped("视频 Agent 停止：" + video["loop"]["summary"])
                 with self.store.transaction():
                     package = self.register_delivery(video["production"], script, previous, request)
                     production = package["content"]

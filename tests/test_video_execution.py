@@ -17,6 +17,20 @@ from pianchang.video_execution import current_commission,execution_limits
 
 
 class VideoExecutionTests(unittest.TestCase):
+    def test_continuation_waits_for_a_review_job_then_resumes_once(self):
+        review = {"id":"9"*32,"kind":"studio_review","project_id":self.pid,"status":"running",
+                  "message":"offline review","trace_id":"8"*32}
+        self.service.state["jobs"].append(review)
+        with patch.object(self.sessions.executor,"submit") as start:
+            queued = self.sessions.submit({"project":self.pid},"video","继续","7"*32,continue_commission=self.cid)
+            self.assertTrue(queued["queued"])
+            start.assert_not_called()
+            review["status"] = "succeeded"
+            self.sessions.release_review(review)
+            self.sessions.release_review(review)
+            start.assert_called_once()
+            self.assertEqual(start.call_args.args[2]["_pi_continue_commission"],self.cid)
+
     def setUp(self):
         temporary=tempfile.TemporaryDirectory();self.addCleanup(temporary.cleanup);self.root=Path(temporary.name)
         tracer=get_tracer(self.root/"traces");self.enterContext(use_context(None,tracer=tracer))
@@ -46,6 +60,113 @@ class VideoExecutionTests(unittest.TestCase):
         self.path.parent.mkdir(parents=True);self.path.write_text(json.dumps({"steps":7,"video_generations":2,"repair_reservations":{"S001":1},
             "limits":{"max_steps":32,"max_video_generations":3}}),encoding="utf-8")
 
+    def test_button_continuation_queues_once_outside_steering_and_keeps_both_click_receipts(self):
+        session_id = self.session["id"]
+        scope = {"project": self.pid}
+        busy = {"id": "1"*32, "kind": "pi_video", "status": "running"}
+        self.service.state["jobs"].append(busy)
+        self.sessions.repo.update(session_id, active_job=busy["id"])
+        with patch.object(self.sessions.executor, "submit") as dispatch:
+            first = self.sessions.submit(scope, "video", "继续", "2"*32, continue_commission=self.cid)
+            self.assertTrue(first["queued"])
+            self.assertEqual(first["message"]["continue_commission"], self.cid)
+            joined = self.sessions.submit(scope, "video", "继续", "3"*32, continue_commission=self.cid)
+            self.assertTrue(joined["duplicate"])
+            self.assertEqual(joined["message"]["job_id"], first["message"]["job_id"])
+            with self.assertRaises(ValueError):
+                self.sessions.submit(scope, "video", "继续", "2"*32, continue_commission="4"*32)
+            options = self.sessions._options(self.sessions.repo.get(session_id), busy)
+            self.assertEqual(options["inbox"](), [])
+            options["on_event"]({"message":{"role":"user","content":"[message_id=" + "2"*32 + "]"}})
+            queued = [m for m in self.sessions.repo.messages(session_id) if m["status"]=="queued"]
+            self.assertEqual([m["id"] for m in queued], ["2"*32])
+            dispatch.assert_not_called()
+
+            busy["status"] = "succeeded"
+            self.sessions.repo.update(session_id, active_job=None)
+            # After an intervening stop leaves the command waiting, an explicit click can wake it.
+            self.sessions.repo.ensure(self.story,"video",source_job=self.run_id)
+            started = self.sessions.submit(scope, "video", "继续", "5"*32, continue_commission=self.cid)
+            job = dispatch.call_args.args[2]
+            self.assertEqual(job["_pi_continue_commission"], self.cid)
+            self.assertEqual(job["id"], first["message"]["job_id"])
+            self.assertEqual(started["job"]["id"], job["id"])
+            self.sessions.repo.delivered(queued[0]["id"])
+            active_duplicate = self.sessions.submit(scope, "video", "继续", "4"*32, continue_commission=self.cid)
+            self.assertEqual(active_duplicate["message"]["job_id"],job["id"])
+            self.sessions.repo.update(session_id, active_job=None)
+            for message_id in ("2"*32, "3"*32, "4"*32, "5"*32):
+                result = self.sessions.submit(scope, "video", "继续", message_id, continue_commission=self.cid)
+                self.assertTrue(result["duplicate"])
+                self.assertEqual(result["message"]["job_id"], job["id"])
+            dispatch.assert_called_once()
+
+    def test_button_requires_project_video_work_user_and_structured_intent(self):
+        scope = {"project":self.pid}
+        for role, mode, sender, actual_scope in (
+                ("video","inspect","user",scope), ("script","work","user",scope),
+                ("video","work","agent",scope), ("video","work","user",{"story":self.run_id})):
+            with self.subTest(role=role, mode=mode, sender=sender, scope=actual_scope), self.assertRaises(ValueError):
+                self.sessions.submit(actual_scope, role, "继续", "2"*32, mode=mode, sender=sender, continue_commission=self.cid)
+        with self.assertRaises(ValueError):
+            self.sessions.submit(scope, "video", "继续", continue_commission=self.cid)
+        with patch.object(self.sessions.executor,"submit") as dispatch:
+            self.sessions.submit(scope, "video", "继续当前制作委托 " + self.cid, "2"*32)
+            self.assertNotIn("_pi_continue_commission",dispatch.call_args.args[2])
+            with self.assertRaises(ValueError):
+                self.sessions.submit(scope,"video","继续当前制作委托 " + self.cid,"2"*32,continue_commission=self.cid)
+
+    def test_confirmed_rejection_is_projected_from_frozen_inputs_and_hidden_during_new_attempt(self):
+        from pianchang.story_spec import digest_json
+        work=self.path.parents[1]
+        shot="S001"
+        repair_id="r1"
+        key=digest_json({"order":str(work),"shot_id":shot,"repair_id":repair_id})
+        trace_id="f"*32
+        record=json.loads(self.path.read_bytes())
+        self.path.write_text(json.dumps({**record,"shooting_plan":self.plan,"trace_context":{"trace_id":trace_id}}))
+        stopped={"id":"1"*32,"kind":"pi_video","project_id":self.pid,"commission_id":self.cid,
+                 "worker_trace_id":trace_id,"status":"interrupted","message":"unverified free text"}
+        self.service.state["jobs"].append(stopped)
+        pin={"asset_id":"asset","revision_id":"r1","purpose":"portrait","subject_id":"actor"}
+        self.view["shots"]=[{"id":shot,"required_refs":[pin]}]
+        output=self.root/"outputs/videos"
+        self.service.video_config=VideoConfig(output_dir=output)
+        path=output/"candidate/job.json"
+        path.parent.mkdir(parents=True)
+        meta={"execution_key":key,"shot_id":shot,"script_asset_ref":self.view["script_ref"],
+              "dependency_sha256":"b"*64,"project_sha256":self.view["spec"]["sha256"],"shooting_plan_id":self.plan["plan_id"]}
+        path.write_text(json.dumps({"metadata":meta}))
+        (work/"impact.json").write_text(json.dumps({"shots":{shot:{"target":{"sha256":"b"*64}}}}))
+        pending={"effect":"video","arguments":{"shot_id":shot,"repair_id":repair_id}}
+        journal=work/"autonomy.json"
+        journal.write_text(json.dumps({"provider_blockers":{shot:{"execution_key":key,"manifest_paths":[str(path)],"pending_tool":pending}}}))
+        evidence={"shot_id":shot,"provider":"volcengine-ark","model":"test-model","http_status":400,"provider_request_id":"vendor-id",
+                  "provider_error":{"code":"test-rejection","message":"private response"},"manifest_sha256":"f"*64,"execution_key":key,
+                  "references":[{**pin,"payload_path":"content[1]"}],"reason":"private response"}
+        with patch("pianchang.video_agent.submission_rejection",return_value=evidence) as verify:
+            shown=current_commission(self.service,self.pid)
+            row,=shown["submission_rejections"]
+            self.assertEqual(row,{"shot_id":shot,"provider":"volcengine-ark","model":"test-model","http_status":400,
+                                  "code":"test-rejection","provider_request_id":"vendor-id",
+                                  "references":[{"revision_id":"r1","purpose":"portrait","subject_id":"actor"}]})
+            self.assertNotIn("unverified",shown["last_execution"]["message"])
+            # A new-style blocker points to the same signed manifest; polling reuses that verification.
+            journal.write_text(json.dumps({"provider_blockers":{shot:{"kind":"submission_rejected","repair_id":repair_id,"execution_key":key,
+                                     "manifest_path":str(path),"manifest_sha256":evidence["manifest_sha256"]}}}))
+            self.assertEqual(current_commission(self.service,self.pid)["submission_rejections"],[row])
+            verify.assert_called_once()
+            active={"id":"2"*32,"kind":"pi_video","project_id":self.pid,"status":"queued","_pi_continue_commission":self.cid}
+            self.service.state["jobs"].append(active)
+            self.assertEqual(current_commission(self.service,self.pid)["submission_rejections"],[])
+            self.service.state["jobs"].remove(active)
+            stopped["worker_trace_id"]="7"*32
+            self.assertEqual(current_commission(self.service,self.pid)["submission_rejections"],[])
+            stopped["worker_trace_id"]=trace_id
+            path.write_text(json.dumps({"metadata":{**meta,"execution_key":"other-order"}}))
+            self.assertEqual(current_commission(self.service,self.pid)["submission_rejections"],[])
+            verify.assert_called_once()
+
     def test_video_detail_reads_frozen_order_without_opening_review_or_new_plan(self):
         from pianchang.studio_flow import studio_video_detail
         pin = {"asset_id": "reference", "revision_id": "r1", "sha256": "9"*64}
@@ -56,6 +177,9 @@ class VideoExecutionTests(unittest.TestCase):
                            result={"turn_complete": True, "action_required": True, "summary":"offline summary",
                                    "provider_response": "omit", "extra_retake": {"proposal_id":"request", "payload":"omit"}})
         self.service.state["jobs"].append({**self.source, "project_id": "other", "id": "f"*32})
+        resumed = {"id":"c"*32,"project_id":self.pid,"kind":"pi_video","status":"running",
+                   "commission_id":self.cid,"commission_job_id":self.source["id"]}
+        self.service.state["jobs"].append(resumed)
         with patch("pianchang.studio_assets.studio_project_for_video", return_value=view), \
              patch("pianchang.studio_jobs.studio_video_plan", side_effect=AssertionError("should not authorize a new plan")), \
              patch("pianchang.studio_flow.studio_asset_catalog", side_effect=AssertionError("irrelevant full catalog")), \
@@ -67,8 +191,9 @@ class VideoExecutionTests(unittest.TestCase):
         self.assertEqual(detail["video_execution"]["plan"], self.plan)
         self.assertEqual(detail["video_execution"]["commission_id"], self.cid)
         self.assertEqual(detail["assets"]["shots"][0]["required_refs"], [pin])
-        self.assertEqual([job["id"] for job in detail["jobs"]], [self.source["id"]])
-        job = detail["jobs"][0]
+        self.assertEqual([job["id"] for job in detail["jobs"]], [resumed["id"],self.source["id"]])
+        self.assertEqual(detail["jobs"][0]["commission_job_id"],self.source["id"])
+        job = detail["jobs"][1]
         self.assertTrue(job["cancel_requested"])
         self.assertEqual(job["plan_id"], "pinned")
         self.assertEqual(job["error"], {"message":"offline error"})
@@ -94,6 +219,15 @@ class VideoExecutionTests(unittest.TestCase):
     def test_failed_plan_preflight_does_not_replace_the_frozen_commission(self):
         self.service.state["jobs"].append({"id":"f"*32,"kind":"studio_video","project_id":self.pid,"status":"failed"})
         self.assertEqual(current_commission(self.service,self.pid)["commission_id"],self.cid)
+
+    def test_resume_reports_current_validation_error_with_old_stopped_checkpoint(self):
+        from pianchang.studio_jobs import resume_video_job
+        self.path.write_text(json.dumps({"status": "needs_input", "result": {"summary": "old provider failure"}}), encoding="utf-8")
+        worker = Mock(side_effect=ValueError("current receipt mismatch"))
+        session = SimpleNamespace(folder=self.path.parents[2], store=self.store, worker=worker)
+        with patch("pianchang.studio_jobs._session", return_value=session):
+            with self.assertRaisesRegex(ValueError, "current receipt mismatch"):
+                resume_video_job(self.service, self.source, explicit_continuation=True)
 
     def test_approval_and_queued_messages_share_one_session_and_unexecuted_plan_is_not_replayed(self):
         job={"id":"f"*32,"kind":"studio_video","project_id":self.pid,"status":"queued","trace_id":current_context()["trace_id"]}
@@ -128,7 +262,8 @@ class VideoExecutionTests(unittest.TestCase):
                 accepted=loop.tools["continue_authorized_production"].execute(commission_id=current["commission_id"])
                 if not accepted["accepted"]:raise AssertionError(accepted)
                 return {"turn_complete":True,"task_complete":False,"summary":"explicit offline continuation request"}
-        def resumed(service,previous):
+        def resumed(service,previous,*,explicit_continuation=False):
+            self.assertTrue(explicit_continuation)
             self.assertEqual(previous["id"],self.source["id"])
             self.assertEqual(BINDING.get()("video")["execution_lock"],observed["lock"])
             return {"task_complete":True,"summary":"explicit offline worker completion; no actual media approval"}
@@ -147,6 +282,73 @@ class VideoExecutionTests(unittest.TestCase):
         with patch("pi_bridge.service.PiLoop",OfflineLoop),patch("pianchang.studio_jobs.resume_video_job") as resume:
             result=self.sessions.run_video(self.session,job,"offline inspect only")
         self.assertNotIn("continue_authorized_production",observed["tools"]);resume.assert_not_called();self.assertFalse(result["task_complete"])
+
+    def _button_job(self):
+        job = {"id":"f"*32, "kind":"pi_video", "status":"running", "project_id":self.pid,
+               "_pi_mode":"work", "_pi_message_id":"8"*32, "_pi_continue_commission":self.cid}
+        self.service.state["jobs"].append(job)
+        self.sessions.repo.append(self.session["id"], "user", "继续当前制作委托", message_id=job["_pi_message_id"],
+                                  job_id=job["id"], status="dispatching", continue_commission=self.cid)
+        self.sessions.repo.update(self.session["id"], active_job=job["id"])
+        return job
+
+    def test_button_resumes_original_worker_despite_historical_arrearage(self):
+        self.source["error"] = "HTTP 400 Arrearage (historical)"
+        self.service.executor = Mock()
+        original = self.path.read_bytes()
+        def resume(service, previous, *, explicit_continuation):
+            self.assertIs(service, self.service)
+            self.assertIs(previous, self.source)
+            self.assertTrue(explicit_continuation)
+            options = BINDING.get()("video")
+            self.assertIn(self.cid, options["initial_message"])
+            self.assertIn(self.session["id"], options["execution_lock"])
+            return {"task_complete":False, "action_required":True, "summary":"offline actual worker result"}
+        with patch("pi_bridge.service.PiLoop", side_effect=AssertionError("button must not ask the chat model")), \
+             patch("pi_bridge.diagnostics.production_diagnostics", return_value={"preflight_ready":True,
+                   "jobs":[{"error":self.source["error"]}]}), \
+             patch.object(self.sessions.executor, "submit") as dispatch, \
+             patch("pianchang.studio_jobs.resume_video_job", side_effect=resume) as worker:
+            response = self.sessions.submit({"project":self.pid}, "video", "继续当前制作委托", "8"*32,
+                                            mode="work", continue_commission=self.cid)
+            bound, session, job, message = dispatch.call_args.args
+            bound(session, job, message)
+        worker.assert_called_once()
+        self.assertEqual(response["job"]["id"], job["id"])
+        self.assertEqual(job["result"]["summary"], "offline actual worker result")
+        self.assertFalse(job["result"]["task_complete"])
+        history = self.sessions.repo.messages(self.session["id"])
+        self.assertEqual(history[-1]["text"], "offline actual worker result")
+        receipt = next(m for m in history if m["id"] == job["_pi_message_id"])
+        self.assertEqual(receipt["status"], "delivered")
+        self.assertEqual(receipt["continue_commission"], self.cid)
+        self.assertEqual(job["commission_id"], self.cid)
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_button_checks_scope_preflight_cancellation_and_current_worker_failure(self):
+        job = self._button_job()
+        with patch("pi_bridge.service.PiLoop", side_effect=AssertionError("no chat request")), \
+             patch("pi_bridge.diagnostics.production_diagnostics", return_value={"preflight_ready":False}) as diagnostics, \
+             patch("pianchang.studio_jobs.resume_video_job", side_effect=ValueError("current media receipt mismatch")) as worker:
+            job["_pi_mode"] = "inspect"
+            with self.assertRaisesRegex(ValueError, "继续指令"):
+                self.sessions.run_video(self.session, job, "offline")
+            job.update(_pi_mode="work", _pi_continue_commission="9"*32)
+            with self.assertRaisesRegex(ValueError, "委托已改变"):
+                self.sessions.run_video(self.session, job, "offline")
+            job["_pi_continue_commission"] = self.cid
+            with self.assertRaisesRegex(ValueError, "模型能力校验"):
+                self.sessions.run_video(self.session, job, "offline")
+            diagnostics.return_value = {"preflight_ready":True}
+            job["cancel_requested"] = True
+            with self.assertRaisesRegex(ValueError, "已取消"):
+                self.sessions.run_video(self.session, job, "offline")
+            worker.assert_not_called()
+            job["cancel_requested"] = False
+            result = self.sessions.run_video(self.session, job, "offline")
+        self.assertEqual(result["continuation_error"], "current media receipt mismatch")
+        self.assertFalse(result["task_complete"])
+        worker.assert_called_once()
 
     def test_proposed_limits_match_the_production_loop_formula(self):
         self.assertEqual(execution_limits(self.plan,3)["max_model_calls"],32)

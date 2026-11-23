@@ -80,6 +80,11 @@ class VideoConfig:
     def max_reference_images(self):
         return 9 if self.sdk_video else 5
 
+    def require_legacy_provider(self):
+        if self.env_file is not None and (self.env_file.parent / "config/models.json").is_file():
+            from pianchang.model_routes import load_routes
+            load_routes(self.env_file).require_provider("aliyun-bailian")
+
     def __post_init__(self):
         if not isinstance(self.api_key, str) or any(c in self.api_key for c in "\r\n"):
             raise VideoError("DASHSCOPE_API_KEY 必须是单行字符串。")
@@ -218,6 +223,7 @@ def load_config(env_file=None, *, allow_missing=False):
 def config_for_references(config, pins, *, snapshot=None, legacy=False):
     purpose = "video.reference_to_video" if pins else "video.text_to_video"
     if legacy:
+        config.require_legacy_provider()
         if getattr(config, "route", None) is not None:
             if config.env_file is None:
                 raise VideoError("历史制作委托需要原百炼连接配置，当前配置未指定其来源。")
@@ -498,6 +504,41 @@ class _MediaRedirect(request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def _omit_encoded_media(body):
+    """Replace OpenAI's bare base64 fields with evidence before persisting JSON."""
+    import hashlib
+    changed = False
+    if not isinstance(body, dict):
+        return False
+
+    def items(key):
+        value = body.get(key)
+        return value if isinstance(value, list) else ()
+
+    def omit(container, key):
+        nonlocal changed
+        value = container.get(key) if isinstance(container, dict) else None
+        if isinstance(value, str) and value and not value.startswith("data:"):
+            encoded = value.encode()
+            container[key] = {"omitted": "inline_media", "encoded_bytes": len(encoded),
+                              "sha256": hashlib.sha256(encoded).hexdigest()}
+            changed = True
+
+    for image in items("data"):
+        omit(image, "b64_json")
+    for choice in items("choices"):
+        message = choice.get("message") if isinstance(choice, dict) else None
+        if isinstance(message, dict):
+            omit(message.get("audio"), "data")
+    for message in items("messages"):
+        parts = message.get("content") if isinstance(message, dict) else None
+        if isinstance(parts, list):
+            for part in parts:
+                if isinstance(part, dict):
+                    omit(part.get("input_audio"), "data")
+    return changed
+
+
 def _trace_http_request(req, timeout):
     """Record the actual request before transport; credentials are SDK-redacted."""
     import hashlib
@@ -506,6 +547,7 @@ def _trace_http_request(req, timeout):
         body = json.loads(raw.decode("utf-8")) if raw is not None else None
     except (ValueError, UnicodeError):
         body = raw.decode("utf-8", errors="replace") if raw is not None else None
+    _omit_encoded_media(body)
     event("http.request", {"method": req.get_method(), "url": req.full_url,
           "headers": dict(req.header_items()), "body": body,
           "wire_body_sha256": hashlib.sha256(raw).hexdigest() if raw is not None else None,
@@ -520,6 +562,8 @@ def _trace_http_response(response, raw, limit):
         body = json.loads(text, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
     except (ValueError, UnicodeError):
         body = None
+    if _omit_encoded_media(body):
+        text = json.dumps(body, ensure_ascii=False)
     headers = dict(response.headers.items()) if response.headers else {}
     event("http.response", {"http_status": getattr(response, "status", getattr(response, "code", None)),
           "headers": headers, "header_request_id": response.headers.get("x-request-id") if response.headers else None,
@@ -535,7 +579,8 @@ def _verified_https_handler():
     # default-context hooks (including inherited TLS key-log file callbacks).
     context=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.load_default_certs()
-    return request.HTTPSHandler(context=context)
+    from pianchang.review_dispatch import ReviewHTTPSHandler
+    return ReviewHTTPSHandler(context=context)
 
 
 def validate_mp4_header(prefix, byte_count):
@@ -571,6 +616,7 @@ class BailianVideoClient:
 
     @traced("bailian.video.http", kind="http")
     def _request(self, method, path, payload=None):
+        self.config.require_legacy_provider()
         key = self.config.api_key
         if not key or key.lower() in ("your_api_key", "your-api-key", "sk-xxxx", "replace_me"):
             if self.config.route is not None and self.config.route.connection != "bailian.media":

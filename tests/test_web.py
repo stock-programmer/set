@@ -116,6 +116,17 @@ class WebHttpTests(unittest.TestCase):
             unwanted = create_server(self.service, host="0.0.0.0", port=0)
             unwanted.server_close()
 
+    def test_continue_button_posts_frozen_commission_through_existing_message_endpoint(self):
+        data={"scope":{"project":"a"*16},"role":"video","text":"继续当前制作委托","mode":"work",
+              "message_id":"b"*32,"continue_commission":"c"*32}
+        with patch("pi_bridge.service.get_sessions") as sessions:
+            submit=sessions.return_value.submit
+            submit.return_value={"job":{"id":"d"*32}}
+            response=self.post("/api/pi/messages",data)
+            self.assertEqual(response[0],202)
+            submit.assert_called_once_with(data["scope"],"video",data["text"],data["message_id"],
+                                           mode="work",continue_commission=data["continue_commission"])
+
     def test_bootstrap_contains_public_state_without_secret(self):
         response = self.request("GET", "/api/bootstrap")
         self.assertEqual(response[0], 200)
@@ -123,6 +134,27 @@ class WebHttpTests(unittest.TestCase):
         self.assertTrue(payload["api_key_configured"])
         self.assertEqual(payload["projects"][0]["id"], "project-one")
         self.assertNotIn(self.service.secret.encode(), response[2])
+
+    def test_human_shot_approval_requires_local_post_and_preserves_candidate_identity(self):
+        path = "/api/projects/project-one/studio/shots/approve"
+        body = {"request_id": "a"*32, "shot_id": "S003", "media_sha256": "b"*64, "report_sha256": "c"*64}
+        with patch("pianchang.shot_approval.approve_shot", return_value={"delivery": {"delivered": True}}) as approve:
+            self.assertNotEqual(self.request("GET", path)[0], 200)
+            self.assertEqual(self.post(path, body, headers={"Origin": "https://other.example"})[0], 403)
+            approve.assert_not_called()
+            reply = self.post(path, body)
+            self.assertEqual(reply[0], 200)
+            self.assertTrue(self.json_body(reply)["delivery"]["delivered"])
+            approve.assert_called_once_with(self.service, "project-one", body)
+            self.assertFalse(self.service.calls)
+
+    def test_feedback_receipts_are_read_only_and_require_exact_job_ids(self):
+        job_id = "a"*32
+        status, _, body = self.request("GET","/api/feedback-watch?job="+job_id)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["jobs"][job_id]["status"], "untracked")
+        self.assertEqual(self.request("GET","/api/feedback-watch?job=wrong")[0], 400)
+        self.assertEqual(self.service.calls, [])
 
     def test_get_project_and_jobs_dispatch_to_read_only_service(self):
         project = self.request("GET", "/api/projects/project-one")

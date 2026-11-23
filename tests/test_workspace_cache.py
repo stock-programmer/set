@@ -45,6 +45,20 @@ class WorkspaceCacheTests(unittest.TestCase):
         self.assertEqual(self.calls,2)
         self.assertNotIn(self.pid,self.service._workspace_reads)
 
+    def test_refresh_reads_corrected_reference_image_route(self):
+        config = self.root / "config" / "models.json"
+        config.parent.mkdir()
+
+        def build(pid):
+            return {**self.build(pid), "config": config.read_text(encoding="utf-8")}
+
+        config.write_text('{"model_id":"rejected"}', encoding="utf-8")
+        first = cached_workspace(self.service, self.pid, build)
+        config.write_text('{"model_id":"corrected-endpoint"}', encoding="utf-8")
+        refreshed = cached_workspace(self.service, self.pid, build)
+        self.assertNotEqual(first["config"], refreshed["config"])
+        self.assertEqual(refreshed["config"], config.read_text(encoding="utf-8"))
+
     def test_sidebar_shot_records_invalidate_cached_workspace_across_projects(self):
         other = "b"*16
         job = {"id": "c"*32, "kind": "studio_video", "status": "running",

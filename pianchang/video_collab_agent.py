@@ -18,6 +18,7 @@ from pianchang.episode_export import export_preview
 from pianchang.collab_store import CollabStore
 from pianchang.reference_assets import resolve_references
 from pianchang.media_tools import inspect_media
+from pianchang.review_dispatch import ReviewOutOfScope, require_unscoped_call
 from pianchang.story_agent import StoryRunner
 from pianchang.story_spec import digest_json, index_sources, normalize_script, validate_compilation, validate_script
 from trace_system import TraceError, current_context, event, get_tracer, register_secret, span, traced
@@ -52,12 +53,13 @@ def _one_model_call(path, request, call):
     # The task directory is exclusively claimed by AgentLoop. Persist the request before dispatch.
     path.parent.mkdir(parents=True, exist_ok=True)
     fingerprint = digest_json(request)
-    if path.exists():
-        saved = _read(path)
-        if saved["input_sha256"] == fingerprint and saved["status"] == "completed":
-            event("video.collab.cached_model_result", {"path": str(path), "input_sha256": fingerprint,
-                  "new_network_request": False}, kind="cache")
-            return saved["response"]
+    saved = _read(path) if path.exists() else None
+    if saved is not None and saved["input_sha256"] == fingerprint and saved["status"] == "completed":
+        event("video.collab.cached_model_result", {"path": str(path), "input_sha256": fingerprint,
+              "new_network_request": False}, kind="cache")
+        return saved["response"]
+    require_unscoped_call()
+    if saved is not None:
         raise ValueError("已有未确认的模型调用或输入变更，已停止重复调用：" + str(path))
     _write(path, {"status": "submitted_or_unknown", "input_sha256": fingerprint, "request": request})
     response = call()
@@ -345,6 +347,17 @@ def _validated_media(clip, *, require_origin=False):
     return job
 
 
+def _manual_approvals(workspace):
+    if hasattr(workspace, "manual_approvals"):
+        return workspace.manual_approvals
+    request_id = getattr(workspace, "request_id", None)
+    if not request_id or workspace.directory.name != "video-spec-" + request_id:
+        return {}
+    from pianchang.shot_approval import read_approvals
+    return read_approvals(workspace.directory, workspace.project, workspace.shots, workspace.reports,
+                          project_id=(workspace.shooting_plan or {}).get("project_id"))
+
+
 class VideoWorkspace:
     def __init__(self, *, script, script_ref, directory, text_config, video_config, template_project, previous,
                  decision_client, vision_config, progress, inbound_message=None, reference_store=None, story_id=None,
@@ -355,6 +368,7 @@ class VideoWorkspace:
         self.template, self.previous = template_project, previous
         self.decision_client, self.progress = decision_client, progress
         self.inbound = copy.deepcopy(inbound_message)
+        self.request_id = (inbound_message or {}).get("message_id")
         self.reference_store, self.story_id, self.register_specs = reference_store, story_id, register_specs
         self.shooting_plan, self.partial = shooting_plan, partial
         self.defer_content_review = bool((shooting_plan or {}).get("repair_existing_only"))
@@ -366,7 +380,7 @@ class VideoWorkspace:
         self.repair = VideoRepair(self)
         context_result = _model_result if shooting_plan is not None else None
         self.tools = [Tool("plan_production", "读取固定剧本，准备或修订分镜，分析实际来源与状态依赖，返回需生成、可复用和需复查的镜头。先调用。", _schema(), self.plan, context_result=context_result),
-                      Tool("generate_shot", "按计划为一个缺失或变化的镜头调用视频模型，等待下载真实素材。每个镜头只提交一次。", _schema(True), self.generate, effect="video", preflight=self.require_reference_inputs, context_result=context_result),
+                      Tool("generate_shot", "按冻结计划提交一个生成任务并等待视频。有 creative_shots 时，同一任务在一段视频中依序拍摄所有创作分镜，只占一次请求；首拍和重拍共享委托总额度。", _schema(True), self.generate, effect="video", preflight=self.require_reference_inputs, context_result=context_result),
                       Tool("reuse_shot", "对复用计划中的镜头核对源任务、文件哈希与新旧依赖，绑定旧媒体至当前版本。", _schema(True), self.reuse, effect="write", context_result=context_result),
                       Tool("review_and_export", "所有镜头就绪后自动验收；有必过失败或未知项则返回修复问题，仅全部通过后导出人工预览。", _schema(), self.review_and_export, effect="write", context_result=context_result),
                       *self.repair.tools]
@@ -387,6 +401,10 @@ class VideoWorkspace:
 
     @traced("video.collab.require_reference_inputs",kind="validation",capture_inputs=False)
     def require_reference_inputs(self,shot_id):
+        if getattr(self, "autonomy", None):
+            blocker = self.autonomy.blocked.get(shot_id, {})
+            if blocker.get("kind") == "submission_rejected":
+                raise ValueError(blocker["reason"])
         if not self._required(shot_id):return
         state=self.reference_inputs(shot_id).read(shot_id)
         if not state["ready"]:raise ValueError("镜头 "+shot_id+" 的参考输入未核验，请先prepare_reference_inputs；当前未提交视频、未预留生成次数。"+json.dumps(state,ensure_ascii=False))
@@ -394,6 +412,44 @@ class VideoWorkspace:
     def _progress(self, summary):
         if self.progress:
             self.progress({"phase": "production", "summary": summary})
+
+    @property
+    def reuses_entire_continuation(self):
+        from pianchang.video_autonomy import all_reused_continuation
+        return bool(self.template and self.partial and all_reused_continuation(self.shooting_plan)
+                    and set(self.shooting_plan["reuse_shots"]) == {shot["id"] for shot in self.template["shots"]})
+
+    @traced("video.collab.prepare_reused_clips", kind="task", capture_inputs=False)
+    def prepare_reused_clips(self):
+        """Bind approved local inputs even when the first Pi decision cannot run."""
+        if not self.reuses_entire_continuation:
+            raise ValueError("此准备步骤需要可核对全部已有镜头的恢复委托。")
+        if (self.directory / "project.json").is_file() and _read(self.directory / "project.json") != self.template:
+            raise ValueError("恢复工程与冻结委托不符。")
+        self.plan()
+        clips, reports = {}, {}
+        for sid in self.shooting_plan["reuse_shots"]:
+            clip = self._reused_clip(sid)
+            clips[sid] = clip
+            record = self._continued_review(sid, clip)
+            if record:
+                self._verify_cached_review(sid, clip, record)
+                reports[sid] = record
+        outputs = (("clips.json", clips), ("reports.json", reports))
+        for name, values in outputs:
+            path = self.directory / name
+            if path.exists():
+                if any(values.get(sid) != saved for sid, saved in _read(path).items()):
+                    raise ValueError("已有候选或报告与恢复来源不一致：" + name)
+        for name, values in outputs:
+            if values:
+                _write(self.directory / name, values)
+        self.shots, self.reports = clips, reports
+        autonomy = getattr(self, "autonomy", None)
+        if autonomy is not None:
+            autonomy.defer_new_clarifications_once = True
+        return {"restored_shots": list(clips), "report_sha256": {s: r["report_sha256"] for s, r in reports.items()},
+                "new_video_posts": 0}
 
     @traced("video.collab.prepare_existing", kind="tool", capture_inputs=False)
     def prepare_existing(self):
@@ -439,6 +495,9 @@ class VideoWorkspace:
                     project["reference_story_id"] = base["reference_story_id"]
         checked = _checked_project(project, self.script)
         impact = _production_impact(checked, self.previous, self.shooting_plan, self.partial)
+        impact_path = self.directory / "impact.json"
+        if self.reuses_entire_continuation and impact_path.is_file() and _read(impact_path) != impact:
+            raise ValueError("现有镜头依赖与冻结委托不符。")
         if self.register_specs:
             self.reference_specs = self.register_specs(checked)
         for shot in checked["shots"]:
@@ -579,29 +638,38 @@ class VideoWorkspace:
     def _required(self, shot_id):
         return _objects(self.project, "shots")[shot_id].get("required_refs", [])
 
-    def retake_pause(self):
+    def retake_pause(self, record=None):
+        if record and not getattr(self, "autonomy", None):
+            failures = {h["shot_id"]: h["retake_failure"]["summary"] for h in self.repair.history if h.get("retake_failure")}
+            if failures and self.stop_check(record)["allowed"]:
+                unresolved = {r["shot_id"] for r in self.acceptance_gate(validate=False)["issues"]}
+                messages = [message for sid, message in failures.items() if sid in unresolved]
+                if messages:
+                    return {"reason": "acceptance_retake_limit", "summary": "\n".join(messages)}
         if (self.shooting_plan or {}).get("acceptance_loop"):
             return None
         if self.failed_shots and set(self.shots) | set(self.failed_shots) == _objects(self.project, "shots").keys():
             return "以下镜头的云端任务已经失败。额外重拍需要批准：" + "、".join(self.failed_shots)
 
-    @traced("video.collab.reuse", kind="tool")
-    def reuse(self, shot_id):
+    def _reused_clip(self, shot_id):
         self._action(shot_id, "reuse")
         source = self.partial or self.previous
         base = source["shots"][shot_id]
         current = self.impact["shots"][shot_id]["target"]["sha256"]
-        if base["dependency_sha256"] != current or base["script_ref"] != source["script_ref"]:
+        if base["shot_id"] != shot_id or base["dependency_sha256"] != current or base["script_ref"] != source["script_ref"]:
             raise ValueError("旧素材输入版本或依赖指纹不一致。")
         _validated_media(base, require_origin=True)
         if base.get("required_refs", []) != self._required(shot_id):
             raise ValueError("旧素材未提供当前镜头要求的参考版本，不能复用。")
         clip = {**base, "operation": "reused", "reused_from": source["script_ref"], "script_ref": self.ref}
+        clip.pop("partial_source", None)
+        clip.pop("continuation_source", None)
         if self.partial is not None:
             key = "continuation" if self.shooting_plan.get("continuation") else "partial"
             clip[key + "_source"] = self.shooting_plan[key]
-        self.shots[shot_id] = clip
-        _write(self.directory / "clips.json", self.shots)
+        return clip
+
+    def _continued_review(self, shot_id, clip):
         if self.partial is not None and self.shooting_plan.get("continuation"):
             source_dir = self.directory.parent / ("video-spec-" + self.shooting_plan["continuation"]["request_id"])
             source_dirs = [source_dir]
@@ -632,11 +700,20 @@ class VideoWorkspace:
                         raise ValueError("历史自动验收报告哈希不符。")
                     if (report.get("project_sha256") == digest_json(self.project)
                             and report.get("media_sha256") == clip["media_sha256"]
-                            and digest_json(report) == record["report_sha256"]):
-                        self.reports[shot_id] = record
+                            and report.get("generation_job_sha256") in (None, clip["generation_job_sha256"])):
                         event("video.collab.continued_review", {"shot_id": shot_id,
                               "report_sha256": record["report_sha256"], "new_model_call": False}, kind="cache")
-                        break
+                        return record
+        return None
+
+    @traced("video.collab.reuse", kind="tool")
+    def reuse(self, shot_id):
+        clip = self._reused_clip(shot_id)
+        self.shots[shot_id] = clip
+        _write(self.directory / "clips.json", self.shots)
+        record = self._continued_review(shot_id, clip)
+        if record:
+            self.reports[shot_id] = record
         self.review_shot(shot_id)
         if (self.defer_content_review and (self.shooting_plan or {}).get("repair_existing_only")
                 and set(self.shooting_plan["reuse_shots"]) <= self.shots.keys()):
@@ -645,6 +722,20 @@ class VideoWorkspace:
                 from pianchang.content_review import run_content_reviews
                 run_content_reviews(self)
         return clip
+
+    def _verify_cached_review(self, shot_id, clip, record):
+        report = _read(record["report_path"])
+        inspection = _read(record["inspection_path"])
+        verify_inspection(inspection)
+        valid = (digest_json(report) == record["report_sha256"]
+                 and report["inspection_sha256"] == digest_json(inspection)
+                 and report["project_sha256"] == digest_json(self.project)
+                 and report["media_sha256"] == clip["media_sha256"]
+                 and report["shot_id"] == shot_id)
+        event("video.collab.review_cache_check", {"path": shot_id, "expected": True,
+              "actual": valid, "status": "PASS" if valid else "FAIL"}, kind="validation")
+        if not valid:
+            raise ValueError("已有自动验收与当前素材不符：" + shot_id)
 
     @traced("video.collab.review_shot", kind="validation", capture_inputs=False)
     def review_shot(self, shot_id):
@@ -663,18 +754,7 @@ class VideoWorkspace:
         if record:
             clip = self.shots[shot_id]
             _validated_media(clip, require_origin=True)
-            report = _read(record["report_path"])
-            inspection = _read(record["inspection_path"])
-            verify_inspection(inspection)
-            valid = (digest_json(report) == record["report_sha256"]
-                     and report["inspection_sha256"] == digest_json(inspection)
-                     and report["project_sha256"] == digest_json(self.project)
-                     and report["media_sha256"] == clip["media_sha256"]
-                     and report["shot_id"] == shot_id)
-            event("video.collab.review_cache_check", {"path": shot_id, "expected": True,
-                  "actual": valid, "status": "PASS" if valid else "FAIL"}, kind="validation")
-            if not valid:
-                raise ValueError("已有自动验收与当前素材不符：" + shot_id)
+            self._verify_cached_review(shot_id, clip, record)
         else:
             self._progress("正在自动验收 " + shot_id)
             record = {**self._review(shot_id), "trace_id": current_context()["trace_id"]}
@@ -732,6 +812,8 @@ class VideoWorkspace:
                                   "contract_sha256": digest_json(contract), "model": self.vision_config.model},
                                   lambda: observe(inspected, contract, config=self.vision_config))
                 vision = {"status": "sampled_frames_observed", "request_id": obs["response"].get("request_id")}
+            except ReviewOutOfScope:
+                raise
             except (TextError, AcceptanceError, ValueError) as exc:
                 # A preview has a separate completion condition from content approval. Keep the actual failure.
                 vision = {"status": "UNKNOWN", "reason": str(exc), "replayed": False}
@@ -820,6 +902,7 @@ class VideoWorkspace:
     @traced("video.collab.acceptance_gate", kind="validation", capture_inputs=False, capture_output=False)
     def acceptance_gate(self, *, validate=True):
         issues, checks = [], []
+        approvals = _manual_approvals(self)
         for shot in (self.project or {}).get("shots", []):
             sid = shot["id"]
             clip, summary = self.shots.get(sid), self.reports.get(sid)
@@ -852,23 +935,42 @@ class VideoWorkspace:
                            "status": "PASS" if valid else "FAIL"})
             if not valid:
                 issues.append({"shot_id": sid, "criterion_id": "acceptance_binding", "status": "FAIL", "reason": "报告与当前候选组合或证据不符，须重新检查。"})
-            required = [r for r in report["results"] if r.get("required")]
+            from pianchang.creative_sound import effective_results
+            required = [r for r in effective_results(shot, report) if r.get("required")]
             contract = _read(Path(summary["report_path"]).parent / "contract.json")
             declared = {r["criterion_id"] for r in contract["requirements"] if r.get("required")}
             from pianchang.acceptance import required_subtitle
             subtitle=required_subtitle(shot)
             if subtitle:declared.add(subtitle["criterion_id"])
+            reviewable = set()
+            if approvals:
+                from pianchang.manual_delivery import adjacent_cut_criteria, human_reviewable_criteria
+                from pianchang.shot_approval import approval_matches
+                declared.update(adjacent_cut_criteria(self.project, sid))
+                decision = approvals.get(sid)
+                if decision and valid and approval_matches(decision, self.request_id, self.project, sid, clip, summary):
+                    if digest_json(contract) == report.get("contract_sha256"):
+                        reviewable = human_reviewable_criteria(contract)
+                    else:
+                        issues.append({"shot_id":sid, "criterion_id":"acceptance_binding", "status":"FAIL",
+                                       "reason":"人工审看的报告与当前验收契约不符。"})
             observed = {r["criterion_id"] for r in required}
             checks.append({"path": sid+".required_coverage", "expected": sorted(declared), "actual":sorted(observed),
                            "status": "PASS" if declared <= observed else "FAIL"})
             if not declared <= observed:
                 issues.append({"shot_id": sid, "criterion_id": "required_coverage", "status": "FAIL", "reason": "报告缺少原契约中的必过项。"})
+            accepted_by_person = False
             for row in required:
+                if row["status"] in {"FAIL", "UNKNOWN"} and row["criterion_id"] in reviewable:
+                    checks.append({"path": sid+"."+row["criterion_id"], "expected":"PASS", "actual":row["status"],
+                                   "status":"PASS", "decision":"human_approved", "trace_id":decision["trace_id"]})
+                    accepted_by_person = True
+                    continue
                 checks.append({"path": sid+"."+row["criterion_id"], "expected":"PASS", "actual":row["status"],
                                "status":row["status"]})
                 if row["status"] != "PASS":
-                    issues.append({"shot_id": sid, **{k: row[k] for k in ("criterion_id", "status", "reason")}})
-            if not required or report.get("task_complete") is not True or report["status"] != "PASS":
+                    issues.append({"shot_id": sid, **{k: row[k] for k in ("criterion_id", "status", "reason", "needs_creative_audio") if k in row}})
+            if not required or (not accepted_by_person and (report.get("task_complete") is not True or report["status"] != "PASS")):
                 if not any(r["shot_id"] == sid for r in issues):
                     issues.append({"shot_id": sid, "criterion_id": "task_complete", "status": "UNKNOWN", "reason": "报告未确认全部必过项通过。"})
         passed = bool(self.project and self.project["shots"]) and not issues
@@ -915,7 +1017,8 @@ class VideoWorkspace:
             if queue["all_required_passed"]:
                 return {"allowed":False,"reason":"须先导出验收通过的预览并完成独立检查。"}
             return {"allowed":True,"reason":"可执行修复已处理完或到达授权上限；以下受阻项仍未通过。",
-                    "blocked":queue["blocked"],"exhausted":queue["exhausted"],"task_complete":False}
+                    "blocked":queue["blocked"],"exhausted":queue["exhausted"],"task_complete":False,
+                    "terminal_summary":queue.get("terminal_summary")}
         if any(h["status"] == "started_or_unknown" for h in self.repair.history):
             return {"allowed":True,"reason":"已有修复执行结果未确认，不能重复提交。"}
         if self.project is None:
@@ -934,7 +1037,9 @@ class VideoWorkspace:
         inconclusive = [r for r in gate["issues"] if r["status"] == "UNKNOWN" and r["criterion_id"] != "media_or_report"]
         policy = (self.shooting_plan or {}).get("acceptance_loop")
         repairable = {r["shot_id"] for r in gate["issues"] if r["shot_id"] not in deferred and r["status"]=="FAIL"} | set(self.failed_shots)
-        available = [sid for sid in repairable if not policy or record.get("repair_reservations", {}).get(sid, 0) < policy["max_repairs_per_shot"]]
+        from pianchang.video_repair import retake_limit
+        available = [sid for sid in repairable if not self.repair.retake_spent(sid)
+                     and record.get("repair_reservations", {}).get(sid, 0) < retake_limit(policy or {}, sid)]
         if remaining > 0 and available:
             return {"allowed":False,"reason":"有未通过项及可用自动修复额度，请依据证据选择工具继续。","shot_ids":available}
         if inconclusive:
@@ -988,23 +1093,35 @@ def run_video_agent(*, script, script_ref, directory, text_config, video_config,
     if autonomous:
         from pianchang.video_autonomy import VideoAutonomy
         workspace.autonomy = VideoAutonomy(workspace,negotiation)
-    catalog = workspace.tools + (negotiation.tools() if negotiation else []) + (workspace.autonomy.tools if autonomous else [])
+    catalog = [t for t in workspace.tools if t.name != "edit_shot_asset" or not shooting_plan]
+    catalog += (negotiation.tools() if negotiation else []) + (workspace.autonomy.tools if autonomous else [])
     from pi_bridge.runtime import make_loop
     from pianchang.reference_inputs import external_review_usage
     from pi_bridge.recovery import strategy_external_usage
     extra={"external_model_usage":lambda:len(external_review_usage(directory/"reference-inputs")["reservations"])+strategy_external_usage(directory)} if getattr(client,"agent_backend",None)!="offline_legacy" else {}
+    prepare = None
+    if (shooting_plan or {}).get("repair_existing_only"):
+        prepare = workspace.prepare_existing
+    elif workspace.reuses_entire_continuation:
+        prepare = workspace.prepare_reused_clips
     loop = make_loop(client, catalog, directory / "agent", role="video", snapshot=workspace.snapshot,
-                     finish_check=workspace.finish_check, progress=progress, pause_check=workspace.retake_pause,
+                     finish_check=workspace.finish_check, progress=progress, pause_check=lambda:workspace.retake_pause(loop.record),
                      stop_check=workspace.stop_check,
-                     prepare=workspace.prepare_existing if (shooting_plan or {}).get("repair_existing_only") else None,
+                     prepare=prepare,
                      maintain=workspace.autonomy.tick if autonomous else None,
                      recover=workspace.autonomy.recover if autonomous else None,**extra)
     workspace.reserve_reference_review=lambda:loop.before_model({"auxiliary_model":"reference_board_review"}) if hasattr(loop,"before_model") else (_ for _ in ()).throw(ValueError("离线旧协议没有视觉核验模型额度，不能提交付费观察。"))
-    if hasattr(loop,"before_model"):workspace.reserve_strategy_review=lambda:loop.before_model({"auxiliary_model":"repair_strategy"})
+    if hasattr(loop, "before_model"):
+        workspace.reserve_strategy_review = lambda: loop.before_model({"auxiliary_model": "repair_strategy"})
+        workspace.reserve_content_review = lambda purpose: loop.before_model({"auxiliary_model": purpose})
+        workspace.reserve_content_review.commission_id = workspace.request_id
+    repair_direction = ("每镜最多一次定向重拍；重拍验收仍不通过时保留报告供人工审看，继续处理尚可执行的其他镜头。"
+                        if (shooting_plan or {}).get("acceptance_loop", {}).get("max_local_edits_per_shot") == 0
+                        else "或edit_shot_asset修改视频资产（例如切黑及剧本原文字幕）。没有表现出来的动作必须重拍，不能用字幕冒充。")
     goal = ("你是独立视频制作 Agent。完成条件是准确表现固定剧本，所有镜头及相邻衔接的必过验收项全部PASS，之后才能导出人工预览。"
             "先plan_production，再按计划generate_shot/reuse_shot。镜头自动验收失败时read_acceptance读取实际证据，"
             "用prepare_shot_repair准备有针对性的修复。根据问题自主选择regenerate_shot修改提示词并使用固定参考重拍，"
-            "或edit_shot_asset修改视频资产（例如切黑及剧本原文字幕）。没有表现出来的动作必须重拍，不能用字幕冒充。"
+            + repair_direction +
             "每次修改自动复验当前候选和相邻衔接。失败项不得删除、标准不得放宽、参考身份不得替换。"
             "也要比较剧本与规格：画外对视、心理认知缺少可核对证据或规格自相矛盾时，具体说明并通过已有协商工具请求澄清。"
             "不要对同一个无效提示盲目重复重拍。缺失邻镜头先补齐，再审衔接。"
@@ -1058,6 +1175,9 @@ def run_video_agent(*, script, script_ref, directory, text_config, video_config,
                       "edge_reviews": workspace.edge_reviews(), "creative_review": "UNKNOWN"}
         if workspace.reference_specs:
             production["reference_specs"] = workspace.reference_specs
+        approvals = _manual_approvals(workspace)
+        if approvals:
+            production.update(manual_approvals=approvals, request_id=workspace.request_id)
         _write(directory / "production.json", production)
     return {"loop": result, "production": production, "impact": workspace.impact, "partial": checkpoint}
 
@@ -1207,7 +1327,7 @@ def main(argv=None):
     parser.add_argument("--reference-store", type=Path, help="镜头所用参考素材的 SQLite 资产库")
     parser.add_argument("--reference-story-id", help="参考素材所属故事（默认读取绑定工程的 reference_story_id）")
     parser.add_argument("--max-video-generations", type=int, required=True, help="本次允许的视频提交上限")
-    parser.add_argument("--vision", action="store_true", help="调用百炼视觉模型观察抽取的证据帧")
+    parser.add_argument("--vision", action="store_true", help="调用已配置的视觉验收模型观察抽取的证据帧")
     parser.add_argument("--env-file", type=Path, default=Path(__file__).resolve().parents[1] / ".env")
     args = parser.parse_args(argv)
     original = _read(args.script)

@@ -70,6 +70,17 @@ class SubtitleAuditTests(unittest.TestCase):
         self.assertIs(self.audit(previous=previous),previous)
         self.client.transcribe.assert_not_called()
 
+    def test_scoped_review_keeps_original_when_subtitle_fallback_has_never_run(self):
+        from pianchang.review_dispatch import retry_review_scope
+        with retry_review_scope({}):
+            self.assertIs(self.audit(), self.previous)
+        self.client.transcribe.assert_not_called()
+        self.assertFalse(list(self.root.rglob("call.json")))
+        completed = self.audit()
+        with retry_review_scope({}):
+            self.assertEqual(self.audit()["receipt_sha256"], completed["receipt_sha256"])
+        self.client.transcribe.assert_called_once()
+
     def test_trace_persistence_failure_stops_before_any_ocr_call(self):
         with patch("pianchang.subtitle_audit.prepare_subtitle_frames",side_effect=TraceError("offline trace store failure")):
             with self.assertRaises(TraceError):self.audit()

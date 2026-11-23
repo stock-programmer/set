@@ -175,6 +175,65 @@ class ProductionProgressTests(unittest.TestCase):
                     with self.assertRaises(KeyError):
                         resolve_production_clip(self.root,self.pid,self.job,"S01",clip["media_sha256"])
 
+    def test_historical_retake_is_readable_only_with_its_original_receipt_and_bytes(self):
+        from pianchang.studio_live_progress import _snapshot
+        original = self.record_generated_shot("S01")
+        self.plan["acceptance_loop"] = {"shot_ids":["S01"],"max_repairs_per_shot":1}
+        with closing(sqlite3.connect(self.db)) as db:
+            db.execute("UPDATE messages SET payload=?", (json.dumps({"script":self.script,"shooting_plan":self.plan}),))
+            db.commit()
+        rid = "9" * 64
+        manifest = json.loads(Path(original["manifest_path"]).read_bytes())
+        folder = self.video / "second-take"
+        folder.mkdir()
+        media = folder / "video.mp4"
+        media.write_bytes(b"second successful video")
+        sha = hashlib.sha256(media.read_bytes()).hexdigest()
+        manifest.update(task_id="retake",provider_response={"output":{"task_id":"retake","task_status":"SUCCEEDED"}},
+                        local_video_path=str(media),download_sha256=sha)
+        manifest["metadata"].update(acceptance_repair={"repair_id":rid},execution_key=digest_json({
+            "order":str(self.work),"shot_id":"S01","repair_id":rid}))
+        path = folder / "job.json"
+        put(path,manifest)
+        retake = {**original,"repair_id":rid,"manifest_path":str(path),"task_id":"retake","media_path":str(media),
+                  "media_sha256":sha, "generation_job_sha256":digest_json(manifest)}
+        history = {"shot_id":"S01","repair_id":rid,"source_clip":original,"result_clip":retake,
+                   "status":"reviewed_rejected_regression"}
+        def write_history():
+            put(self.work / "repair-history.json",{"history":[history]})
+        def versions():
+            data,_ = _snapshot(self.root,self.pid,self.job,None,lambda sid,digest:"/"+digest,
+                               include_reviews=False,version_paths={})
+            return data["shots"][0]["versions"]
+        write_history()
+        initial, second = versions()
+        self.assertEqual([(v["kind"], v["selected"]) for v in (initial,second)], [("initial",True),("retake",False)])
+        self.assertEqual(second["selection_reason"],"rejected_regression")
+        self.assertEqual(resolve_production_clip(self.root,self.pid,self.job,"S01",sha),media)
+        history["status"] = "blocked_evaluation"
+        write_history()
+        self.assertEqual(versions()[1]["preview_url"], "/"+sha)
+        self.assertNotIn("report",versions()[1])
+        for wrong_sid in ("S02","other"):
+            with self.assertRaises(KeyError):
+                resolve_production_clip(self.root,self.pid,self.job,wrong_sid,sha)
+        media.write_bytes(b"changed historical video")
+        with self.assertRaises(KeyError):
+            resolve_production_clip(self.root,self.pid,self.job,"S01",sha)
+        media.write_bytes(b"second successful video")
+        manifest["provider_response"]["output"]["task_id"] = "other"
+        put(path,manifest)
+        retake["generation_job_sha256"] = digest_json(manifest)
+        write_history()
+        self.assertEqual([v["task_id"] for v in versions()], [original["task_id"]])
+        manifest["provider_response"]["output"]["task_id"] = "retake"
+        manifest["metadata"]["execution_key"] = digest_json({"order":"other","shot_id":"S01","repair_id":rid})
+        put(path,manifest)
+        retake["generation_job_sha256"] = digest_json(manifest)
+        write_history()
+        with self.assertRaises(KeyError):
+            resolve_production_clip(self.root,self.pid,self.job,"S01",sha)
+
     def test_later_observation_requires_same_provider_task_and_original_manifest(self):
         manifest,_ = self.manifest("S02","RUNNING")
         self.job["status"] = "failed"

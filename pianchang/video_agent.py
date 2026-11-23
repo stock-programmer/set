@@ -276,7 +276,9 @@ def _render_shot(project, shot, trace, prompt_override):
     event_by_id = {e["id"]: e for e in project["events"]}
     events = [event_by_id[eid]["reason"] for eid in shot["event_ids"]]
     prompt = prompt_override if prompt_override is not None else "\n".join([
-        "生成单镜头短剧视频。保持人物外观、服装、道具和空间关系稳定。",
+        ("按下列分镜顺序生成一段有切镜的完整短剧视频。保持人物、服装、道具和空间关系稳定。"
+         if len(shot.get("creative_shots", [])) > 1 else
+         "生成单镜头短剧视频。保持人物外观、服装、道具和空间关系稳定。"),
         f"本镜头：{shot.get('description', '')}",
         "人物与场景设定：" + _json(canonical),
         "镜头开始状态（ID对应上述设定）：" + _json(before),
@@ -359,6 +361,43 @@ def verified_local_failure(job, manifest):
              "candidate_key":job["candidate_key"], "network_dispatched":False}
     return any(tracer.resolve(e["data"]) == proof for e in tracer.get_events(context["trace_id"],
                span_id=context["span_id"], names=["video.task_not_dispatched"]))
+
+
+def submission_rejection(job, manifest):
+    """Read a definitive negative submission receipt. A missing task ID alone proves nothing."""
+    from pianchang.reference_usage import verify_reference_exchange
+    receipt = job.get("reference_receipt") or {}
+    if (job.get("status") != "SUBMISSION_REJECTED" or job.get("task_id")
+            or receipt.get("status") != "PROVIDER_REJECTED" or verify_reference_receipt(job)["status"] != "PASS"):
+        return None
+    wire = verify_reference_exchange(job, receipt, receipt["trace_id"])
+    if wire["status"] != "MATCHED_RESPONSE":
+        return None
+    error = wire.get("provider_error") or {}
+    detail = " ".join(error.values()) or str(job.get("last_error") or "")[:800]
+    slots = set(re.findall(r"\bcontent\[\d+\]", detail))
+    references = [{k: row[k] for k in ("asset_id", "revision_id", "purpose", "payload_path")}
+                  for row in receipt["submitted_refs"] if row["payload_path"].split(".", 1)[0] in slots]
+    provider = job.get("provider") or (job["metadata"].get("model_route") or {}).get("provider") or "aliyun-bailian"
+    reason = f"{provider} 已拒绝视频提交（HTTP {receipt['http_status']}）：{detail}"
+    if error.get("code") == "InputImageSensitiveContentDetected.PrivacyInformation":
+        reason += " 请选用符合供应商要求的参考图，并重新确认使用新素材的拍摄计划。"
+    return {"kind":"submission_rejected", "terminal_failure":True, "reason":reason,
+            "provider":provider, "model":job["request"]["model"], "http_status":receipt["http_status"],
+            "provider_request_id":receipt.get("provider_request_id"), "provider_error":error, "references":references,
+            "shot_id":job.get("metadata", {}).get("shot_id"), "manifest_path":str(manifest),
+            "manifest_sha256":_digest(job), "execution_key":job.get("metadata", {}).get("execution_key")}
+
+
+def bound_submission_rejection(job, manifest, *, directory, shot_id, repair_id, script_ref, dependency_sha256):
+    from pianchang.story_spec import digest_json
+    expected_key = digest_json({"order":str(directory), "shot_id":shot_id, "repair_id":repair_id})
+    meta = job.get("metadata") or {}
+    if (meta.get("execution_key") != expected_key or meta.get("shot_id") != shot_id
+            or meta.get("script_asset_ref") != script_ref or meta.get("dependency_sha256") != dependency_sha256):
+        return None
+    rejection = submission_rejection(job, manifest)
+    return {**rejection, "repair_id":repair_id} if rejection else None
 
 
 def _reserve_submission(directory, name, payload, metadata, effective, config):
@@ -545,6 +584,9 @@ class VideoRunner:
         except FileExistsError:
             path, existing = self._load(path)
             if not existing.get("task_id"):
+                rejected = submission_rejection(existing, path)
+                if rejected:
+                    raise VideoError(rejected["reason"] + " 已保留原回执：" + str(path))
                 raise VideoError(f"已有提交记录但尚无任务 ID，不能自动再次提交：{path}。"
                                  "请先核对原供应商的任务记录。")
             if required:

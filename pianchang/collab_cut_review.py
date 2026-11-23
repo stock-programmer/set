@@ -246,7 +246,7 @@ def main(argv=None):
     parser.add_argument("--left",required=True)
     parser.add_argument("--right",required=True)
     parser.add_argument("--directory",type=Path,default=HOME_DIR)
-    parser.add_argument("--vision",action="store_true",help="用百炼视觉模型观察切点两侧实际帧，一次调用")
+    parser.add_argument("--vision",action="store_true",help="用已配置的视觉验收模型观察切点两侧实际帧，一次调用")
     args=parser.parse_args(argv)
     report=review_revision(args.directory,args.run_id,args.revision,args.left,args.right,vision=args.vision)
     print(json.dumps({k:report[k] for k in ("trace_id","cut","window","technical_status","audiovisual_continuity")},

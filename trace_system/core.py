@@ -16,7 +16,8 @@ import threading
 import time
 import traceback
 import uuid
-from contextlib import contextmanager
+from collections import deque
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -27,6 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 _CURRENT = contextvars.ContextVar("agent_trace_context", default=None)
 _TRACERS = {}
 _LOCK = threading.RLock()
+_WRITER_GATES = {}
 _SECRETS = set()
 _SECRET_LOCK = threading.RLock()
 _SENSITIVE_TEXT = re.compile(r"sk-|bearer|authoriz|cookie|data:|api[_-]?key|password|secret|token|signature|https?://|[?<]",re.IGNORECASE)
@@ -51,6 +53,33 @@ class _LiteralPayload(dict):
 
 class TraceError(RuntimeError):
     """Trace recording failed; a billable operation must not silently proceed."""
+
+
+class _WriterGate:
+    """Give same-process writers a turn before they contend for SQLite's lock."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._queue = deque()
+
+    @contextmanager
+    def hold(self):
+        ticket = object()
+        with self._condition:
+            self._queue.append(ticket)
+            try:
+                while self._queue[0] is not ticket:
+                    self._condition.wait()
+            except BaseException:
+                self._queue.remove(ticket)
+                self._condition.notify_all()
+                raise
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._queue.popleft()
+                self._condition.notify_all()
 
 
 def _json(value):
@@ -201,6 +230,10 @@ class Tracer:
         self.inline_bytes = inline_bytes
         self.secrets = set()
         self.path = self.directory / "trace.sqlite3"
+        self._writer_mutex = "Local\\PianchangTraceWriter-" + hashlib.sha256(os.path.normcase(str(self.path)).encode()).hexdigest()
+        with _LOCK:
+            key = (os.getpid(), os.path.normcase(str(self.path)))
+            self._writer_gate = _WRITER_GATES.setdefault(key, _WriterGate())
         self._pool_lock = threading.RLock()
         self._pool_sessions = 0
         self._pool = []
@@ -208,7 +241,7 @@ class Tracer:
         self._read_transaction = contextvars.ContextVar("trace_read_transaction",default=None)
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
-            with self._db() as db:
+            with self._write_db() as db:
                 db.execute("PRAGMA journal_mode=WAL")
                 db.executescript("""
                     CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -289,8 +322,24 @@ class Tracer:
                 secrets = self._secret_snapshot()
                 artifacts = {}
                 prepared = [self._prepare_read_record(record, secrets, artifacts) for record in records]
-                with self._db() as db:
-                    db.execute("BEGIN IMMEDIATE")
+                with self._write_db() as db:
+                    try:
+                        db.execute("BEGIN IMMEDIATE")
+                    except sqlite3.OperationalError as exc:
+                        owner = context[1]
+                        if (getattr(exc, "sqlite_errorname", None) == "SQLITE_BUSY" and not db.in_transaction
+                                and failure is None and owner and len(records) <= 1024
+                                and all(r["trace_id"] == owner["trace_id"] for r in records)):
+                            stopped = TraceError("Trace database operation failed: OperationalError [SQLITE_BUSY]")
+                            stopped.uncommitted_read_batch = dict(owner)
+                            # Only the operation identities are evidence of what was staged.
+                            # They were never committed as successful child events.
+                            stopped.staged_read_operations = [
+                                [r["span_id"], r["parent_span_id"], r["kind"], r["name"],
+                                 r["data"].get("status") if r["kind"] == "span.end" else None]
+                                for r in records]
+                            raise stopped from exc
+                        raise
                     # A credential may have been registered during preparation or
                     # while waiting for the writer. Retry outside the transaction.
                     with _SECRET_LOCK:
@@ -327,6 +376,23 @@ class Tracer:
             "data":self.sanitize(data),"pending_read_batch":True}
         batch["records"].append(record)
         return record
+
+    @contextmanager
+    def _write_db(self):
+        # SQLite's busy handler does not give waiting connections FIFO priority.
+        # A stream of refresh batches can otherwise repeatedly overtake a paid
+        # task's evidence write until its busy timeout expires. Queue writers
+        # before opening a transaction, sharing the gate across Tracer objects.
+        # Reads retain the normal connection path and never wait on this gate.
+        if self._pool_pid != os.getpid():
+            raise TraceError("Inherited SQLite connections cannot be used in a child process.")
+        with self._writer_gate.hold():
+            # More than one Python process writes during a workbench handoff.
+            # Windows' SQLite busy handler cannot queue those processes fairly.
+            from .windows_writer import writer_mutex
+            lock = writer_mutex(self._writer_mutex) if os.name == "nt" else nullcontext()
+            with lock, self._db() as db:
+                yield db
 
     @contextmanager
     def _db(self):
@@ -452,7 +518,7 @@ class Tracer:
                 "links":links or [],"process":{"pid":os.getpid(),"hostname":socket.gethostname(),"instance_id":_PROCESS_INSTANCE,"python_version":sys.version}})
             batch["starts"][(context["trace_id"],context["span_id"])]=record
             return Span(self,context,parent_id,str(name),str(kind),record["timestamp"])
-        with self._db() as db:
+        with self._write_db() as db:
             if not db.in_transaction:db.execute("BEGIN IMMEDIATE")
             if selected_parent and not db.execute("SELECT 1 FROM events WHERE trace_id=? AND span_id=? AND kind='span.start'", (context["trace_id"], parent_id)).fetchone():
                 raise TraceError("Parent span does not exist.")
@@ -482,7 +548,7 @@ class Tracer:
         if batch is not None:
             started=self._batch_start(batch,context)
             return self._stage(batch,context,started["parent_span_id"],kind,name,data)
-        with self._db() as db:
+        with self._write_db() as db:
             if not db.in_transaction:db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT parent_span_id FROM events WHERE trace_id=? AND span_id=? AND kind='span.start'", (context["trace_id"], context["span_id"])).fetchone()
             if not row:
@@ -494,6 +560,8 @@ class Tracer:
         context = self._context(context)
         if status not in {"OK", "ERROR", "UNKNOWN"}:
             raise ValueError("Span status must be OK, ERROR or UNKNOWN.")
+        batch_failure = (getattr(error, "staged_read_operations", None) if isinstance(error, TraceError)
+                         and getattr(error, "uncommitted_read_batch", None) == context and status == "ERROR" else None)
         if isinstance(error, BaseException):
             error = {"type": type(error).__name__, "message": str(error),
                      "stack": "".join(traceback.format_exception(type(error), error, error.__traceback__))}
@@ -510,8 +578,16 @@ class Tracer:
             record=self._stage(batch,context,started["parent_span_id"],"span.end",started["name"],{"status":status,"output":output,"error":error,"duration_ms":round(duration_ms,3)})
             batch["ends"][key]=record
             return record
-        with self._db() as db:
-            if not db.in_transaction:db.execute("BEGIN IMMEDIATE")
+        with self._write_db() as db:
+            if not db.in_transaction:
+                try:
+                    db.execute("BEGIN IMMEDIATE")
+                except sqlite3.OperationalError as exc:
+                    if getattr(exc, "sqlite_errorname", None) == "SQLITE_BUSY" and status == "OK" and error is None:
+                        failure = TraceError("Trace database operation failed: OperationalError [SQLITE_BUSY]")
+                        failure.unwritten_span_end = dict(context)
+                        raise failure from exc
+                    raise
             previous = db.execute("SELECT * FROM events WHERE trace_id=? AND span_id=? AND kind='span.end' ORDER BY trace_seq LIMIT 1", (context["trace_id"], context["span_id"])).fetchone()
             if previous:
                 return self._row(previous)
@@ -521,6 +597,8 @@ class Tracer:
             if duration_ms is None:
                 duration_ms = max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(started["timestamp"])).total_seconds() * 1000)
             record = {"status": status, "output": self._pack(db, output), "error": self._pack(db, error), "duration_ms": round(duration_ms, 3)}
+            if batch_failure is not None:
+                record["read_batch_before_begin"] = self._pack(db, batch_failure)
             return self._append_in_db(db, context, started["parent_span_id"], "span.end", started["name"], record)
 
     @staticmethod

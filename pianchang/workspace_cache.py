@@ -47,7 +47,8 @@ def _signatures(service, pid, dependencies):
     store=service.root/"outputs/collaborations/assets.sqlite3"
     registry=service.root/"outputs/pi/registry.sqlite3"
     common={str(record["path"]) for record in records.values()}
-    common.update(str(p) for p in [source.parent/"studio.json",service.root/".env",store,Path(str(store)+"-wal")])
+    common.update(str(p) for p in [source.parent/"studio.json",service.root/".env",
+                                   service.root/"config"/"models.json",store,Path(str(store)+"-wal")])
     common.update(str(p) for p in Path(service.video_config.output_dir).glob("*/job.json"))
     files=common.union(*(paths for paths, _ in dependencies))
     stats={path:_stat(path) for path in files}
@@ -58,6 +59,12 @@ def _signatures(service, pid, dependencies):
 
 def _paths(service,value):
     result=set();store=service.root/"outputs/collaborations"
+    studio = value.get("studio") or {}
+    review = studio.get("incomplete_production") or {}
+    run, request = studio.get("run_id"), review.get("request_id")
+    if all(isinstance(key, str) and re.fullmatch(r"[0-9a-f]{32}", key) for key in (run, request)):
+        work = store / "runs" / run / ("video-spec-" + request)
+        result.update(str(work / name) for name in ("manual-approvals", "clips.json", "reports.json"))
     for project in value.get("projects", []):
         job = (project.get("opening") or {}).get("video_job") or {}
         run, message = job.get("run_id"), job.get("message_id")

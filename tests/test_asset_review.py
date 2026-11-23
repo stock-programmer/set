@@ -136,6 +136,14 @@ class ReferenceLoopTests(unittest.TestCase):
                                                dict(next_body,feedback="配色必须参照林岚的定妆照"))
             mandatory = next(c for c in explicit["checks"] if c["path"] == "anchor_0")
             self.assertEqual((mandatory["required"],explicit["status"]),(True,"UNKNOWN"))
+            with patch("pianchang.asset_review._anchors",return_value=[]):
+                retried = review_studio_candidate(self.service,"project-a",second["pin"],next_body,
+                                                  prior_visual_review=explicit)
+            self.assertEqual(retried["previous_review_ref"],explicit["review_ref"])
+            self.assertEqual(retried["anchor_pins"],explicit["anchor_pins"])
+            self.assertEqual(retried["visual_input_version"],"reference-visual-input/3")
+            self.assertEqual(retried["status"],"UNKNOWN")
+            self.assertTrue(next(c for c in retried["checks"] if c["path"]=="anchor_0")["required"])
             palette_drift = True
             drift = review_studio_candidate(self.service,"project-a",second["pin"],next_body)
             self.assertEqual(drift["status"],"FAIL")

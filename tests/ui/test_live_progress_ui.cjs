@@ -67,6 +67,11 @@ async function main() {
   assert.ok(!walk(m.element).some(n=>n.textContent==="整片验收通过 · 可交付"));
   data={...data,production_complete:true,shots:["S001","S002","S003"].map(id=>shot(id,true,"PASS"))};await m.refresh(true);
   assert.ok(walk(m.element).some(n=>n.textContent==="整片验收通过 · 可交付"));
+  data={...data,message_id:messageId,production_complete:false,preview_gate:{ready:true,request_id:messageId},
+    job_status:"failed",phase:"stopped",shots:[{...shot("S001",true,"FAIL"),human_approved:true},...data.shots.slice(1)]};
+  await m.refresh(true);
+  assert.equal(verdict("S001").textContent,"已人工通过");
+  assert.ok(walk(m.element).some(n=>n.textContent==="成片已交付 · 可预览"));
   video.currentTime=3; video.paused=false;
   data={...data,preview_gate:{ready:false},production_complete:false,job_status:"failed",phase:"stopped",reason:"确认前中断",current_shot_id:null,completed:2,
     shots:[shot("S001",true),shot("S002",true),{shot_id:"S003",status:"not_started",operation:"new"}]};

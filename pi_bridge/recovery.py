@@ -81,17 +81,21 @@ def strategy_external_usage(work):
 
 @traced("pi.recovery.watch",kind="task",capture_inputs=False,capture_output=False)
 def watch_recovery(service,stop):
-    """Retry storage health, not paid calls, after fail-closed interruptions."""
+    """Watch trace storage and scoped review observations on existing commissions."""
     from trace_system import TraceError
     from pianchang.video_autonomy import enqueue_recovery
+    from pianchang.review_recovery import poll_review_retries
+    reviewed = {}
     while not stop.wait(15):
         with service.lock:
             jobs=list(service.state["jobs"])
             failed_orders={j.get("message_id") for j in jobs if j.get("_autonomy_enabled") and
                 j.get("status") in {"failed","interrupted"} and not j.get("cancel_requested")}
             needed=any(j.get("trace_incomplete") and (j.get("_autonomy_enabled") or j.get("commission_id") in failed_orders) for j in jobs)
-        if not needed:continue
-        try:enqueue_recovery(service,recover_trace_failures=True)
+        try:
+            if needed:
+                enqueue_recovery(service,recover_trace_failures=True)
+            poll_review_retries(service,reviewed)
         except TraceError:continue  # no effects were permitted without durable evidence
         except (OSError,ValueError,KeyError) as exc:
             event("pi.recovery.watch_blocked",{"type":type(exc).__name__,"reason":str(exc),"new_video_posts":0},kind="error")

@@ -11,7 +11,7 @@ from pianchang.app_service import service_tool
 from pianchang.collab_store import CollabStore
 from pianchang.reference_assets import _prepare_binding
 from pianchang.story_spec import digest_json, validate_compilation
-from pianchang.studio_assets import studio_asset_catalog, studio_project_for_video
+from pianchang.studio_assets import studio_asset_catalog, studio_project_for_video, sync_published_spec
 from trace_system import TraceError, current_context, event, traced, use_context
 
 ASSET_ACTIONS = {"asset_production", "asset_regenerate", "asset_inspect", "studio_reference"}
@@ -27,6 +27,7 @@ def schedule_published_assets(service, directory, pid, source_job, style="", pro
         # Startup can recover the order even if the server exits the
         # instant the new project becomes visible in the web catalog.
         write_json(directory / "project.json", project)
+        sync_published_spec(service,pid,directory/"project.json")
     job = service.submit("asset_production", pid, intent["body"], key)
     return {"id": job["id"], "trace_id": job["trace_id"]}
 
@@ -40,9 +41,10 @@ def recover_asset_intents(service):
             project = path.parent / "project.json"
             if not project.is_file() or intent["project_id"] != project_id_for_path(project):
                 continue
-            if any(j.get("_idempotency_key") == intent["key"] for j in service.state["jobs"]):
-                continue
             with use_context(intent["context"], tracer=service.tracer):
+                sync_published_spec(service,intent["project_id"],project)
+                if any(j.get("_idempotency_key") == intent["key"] for j in service.state["jobs"]):
+                    continue
                 service.submit("asset_production", intent["project_id"], intent["body"], intent["key"])
         except (KeyError, ValueError, OSError) as exc:
             event("studio.assets.recovery_failed", {"path": str(path), "error": str(exc)}, kind="error")
@@ -298,7 +300,14 @@ def validate_asset_order(service, pid, action, body):
     catalog = studio_asset_catalog(service, pid)
     if catalog.get("pending_script_ref"):
         raise ValueError("新版剧本已发布，请先更新对应的制作规格。")
-    allowed = {"style"} if action == "asset_production" else {"pin"} if action == "asset_inspect" else {
+    if action == "asset_production" and "resume_images_from" in body:
+        from pianchang.image_recovery import verified_image_recovery
+        return verified_image_recovery(service, pid, body, catalog)
+    if action == "asset_regenerate" and set(body) == {"resume_voice_from"}:
+        from pianchang.voice_recovery import verified_voice_recovery
+        order, _ = verified_voice_recovery(service, pid, body["resume_voice_from"], catalog)
+        return order
+    allowed = {"style"} if action == "asset_production" else {"pin","review_voice_from"} if action == "asset_inspect" else {
         "subject_id", "purpose", "feedback", "asset_id", "parent_revision", "style"}
     if set(body) - allowed:
         raise ValueError("资产委托包含未支持的参数。")
@@ -312,6 +321,9 @@ def validate_asset_order(service, pid, action, body):
         original = body.get("pin")
         if not isinstance(original, dict):
             raise ValueError("请提供待审媒体的精确版本。")
+        if "review_voice_from" in body:
+            from tools.workbench_loop_voice_review import verify_inspection
+            verify_inspection(service, pid, body["review_voice_from"], original)
         result.update(subject_id=original.get("subject_id"), purpose=original.get("purpose"))
     entity = next((e for e in catalog["entities"] if e["id"] == result.get("subject_id")), None)
     if not entity or result.get("purpose") not in entity["purposes"]:
@@ -338,7 +350,8 @@ def validate_asset_order(service, pid, action, body):
 
 def _store_unit(service, pid, row):
     event("studio.assets.unit.transition", {k: row.get(k) for k in
-          ("subject_id", "purpose", "status", "candidate", "selected_pin", "basis", "job_id", "trace_id", "error")}, kind="state")
+          ("subject_id", "purpose", "status", "candidate", "selected_pin", "basis", "job_id", "trace_id", "error",
+           "rejected_image_model")}, kind="state")
     with service.lock:
         work = service.state["asset_work"][pid]
         work["items"][_key(row["subject_id"], row["purpose"])] = copy.deepcopy(row)
@@ -349,13 +362,18 @@ def _pin(entry):
     return {k: entry[k] for k in ("asset_id", "revision_id", "sha256", "media_sha256", "subject_id", "purpose")}
 
 
-def _one(service, pid, job, catalog, item, order, style):
-    from pianchang.asset_review import review_studio_candidate, run_reference_loop
+def _one(service, pid, job, catalog, item, order, style, *, saved_voice=None):
+    from pianchang.asset_review import _repair_instructions, review_studio_candidate, run_reference_loop
+    prior_media = (item.get("candidate"), item.get("review")) if order.get("repair_review_ref") or order.get("review_only") else None
     item.update(status="generating", review=None, candidate=None, error_span_id=None, job_id=job["id"], trace_id=job["trace_id"],
-                feedback=order.get("feedback", ""), error=None)
+                feedback=order.get("feedback", ""), error=None, rejected_image_model=None, rejected_image_code=None)
+    if order.get("review_only"):
+        item["candidate"], item["review"] = prior_media
     _store_unit(service, pid, item)
     request = {k: order[k] for k in ("asset_id", "parent_revision", "feedback") if k in order}
     request.update(subject_id=item["subject_id"], purpose=item["purpose"], style=style, max_attempts=2)
+    if order.get("image_route_sha256"):
+        request.update(max_attempts=order["remaining_attempts"], spec_sha256=order["spec_sha256"])
     def checkpoint(attempt):
         if attempt.get("review_ref") and not attempt.get("review"):
             ref = attempt["review_ref"]
@@ -369,17 +387,29 @@ def _one(service, pid, job, catalog, item, order, style):
     try:
         if order.get("pin"):
             pin = order["pin"]
-            review = review_studio_candidate(service, pid, pin, request)
+            if order.get("review_only"):
+                _check("原候选复核报告", order["previous_review"], prior_media[1]["review_ref"])
+                review = review_studio_candidate(service, pid, pin, request, prior_visual_review=prior_media[1])
+            else:
+                review = review_studio_candidate(service, pid, pin, request)
             checked = {"pin":pin, "review":review, "verdict":review["status"], "review_ref":review["review_ref"],
                        "trace_id":review["trace_id"]}
             checkpoint(checked)
             result = {"candidate":pin, "review":review, "attempts":[checked]}
-            if job["kind"] == "asset_production" and review["status"] != "PASS" and not review.get("observation_error"):
-                issues = [c for c in review["checks"] if c.get("required",True) and c["status"] != "PASS" and
-                          (pin["purpose"] == "voice" or "candidate" in c.get("frame_ids", []))]
-                if issues:
-                    request.update(max_attempts=1)
-                    result = run_reference_loop(service, pid, request, on_attempt=checkpoint)
+            if not order.get("review_only") and job["kind"] == "asset_production" and review["status"] != "PASS" and _repair_instructions(review):
+                request.update(max_attempts=1)
+                result = run_reference_loop(service, pid, request, on_attempt=checkpoint)
+        elif saved_voice is not None:
+            request["max_attempts"] = order["remaining_voice_attempts"]
+            result = run_reference_loop(service, pid, request, on_attempt=checkpoint, saved_voice=saved_voice)
+        elif order.get("image_route_sha256"):
+            def save_generated(pin):
+                # The provider has returned an image. A separate review failure must not duplicate that generation.
+                item["candidate"] = pin
+                _store_unit(service, pid, item)
+            options = {"repair_review_ref":order["repair_review_ref"]} if order.get("repair_review_ref") else {}
+            result = run_reference_loop(service, pid, request, on_attempt=checkpoint,
+                                        image_route_sha256=order["image_route_sha256"], on_generated=save_generated, **options)
         else:
             result = run_reference_loop(service, pid, request, on_attempt=checkpoint)
         for attempt in result["attempts"]:
@@ -397,7 +427,11 @@ def _one(service, pid, job, catalog, item, order, style):
     except TraceError:
         raise
     except Exception as exc:
-        item.update(status="needs_attention", error=service.sanitize(str(exc)), error_span_id=current_context()["span_id"])
+        if prior_media and not item.get("candidate"):
+            item["candidate"], item["review"] = prior_media
+        item.update(status="needs_attention", error=service.sanitize(str(exc)), error_span_id=current_context()["span_id"],
+                    rejected_image_model=service.sanitize(getattr(exc, "rejected_image_model", None)),
+                    rejected_image_code=getattr(exc, "rejected_image_code", None))
     _store_unit(service, pid, item)
 
 
@@ -407,9 +441,27 @@ def run_asset_order(service, job, order):
         return _run_asset_order(service, job, order)
 
 
+def _produce_item(service, pid, job, catalog, unit, task, style, *, saved_voice=None):
+    with service.tracer.span("studio.assets.produce_item", kind="task", inputs={"project_id": pid,
+            "subject_id": unit["subject_id"], "purpose": unit["purpose"], "job_id": job["id"]}) as production:
+        _one(service, pid, job, catalog, unit, task, style, saved_voice=saved_voice)
+        production.set_output({"status": unit["status"], "candidate": unit.get("candidate"), "error": unit.get("error")})
+
+
 def _run_asset_order(service, job, order):
     pid = job["project_id"]
     catalog = studio_asset_catalog(service, pid)
+    if order.get("resume_images_from"):
+        from pianchang.image_recovery import run_image_recovery
+        return run_image_recovery(service, job, order, catalog)
+    saved_voice = None
+    if order.get("resume_voice_from"):
+        from pianchang.voice_recovery import verified_voice_recovery
+        checked, saved_voice = verified_voice_recovery(service, pid, order["resume_voice_from"], catalog)
+        _check("原试音委托", order, checked)
+    if "review_voice_from" in order:
+        from tools.workbench_loop_voice_review import verify_inspection
+        verify_inspection(service, pid, order["review_voice_from"], order["pin"])
     _check("资产计划的剧本和设定", order["basis"], _basis(catalog))
     if catalog.get("pending_script_ref"):
         raise ValueError("当前制作用的剧本版本已经落后，请更新制作规格。")
@@ -444,10 +496,7 @@ def _run_asset_order(service, job, order):
             previous = next((r for r in entity["references"] if r["purpose"] == unit["purpose"]), None)
             if previous:
                 task.update(asset_id=previous["asset_id"], parent_revision=previous["revision_id"], pin=_pin(previous))
-        with service.tracer.span("studio.assets.produce_item", kind="task", inputs={"project_id": pid,
-                "subject_id": unit["subject_id"], "purpose": unit["purpose"], "job_id": job["id"]}) as production:
-            _one(service, pid, job, catalog, unit, task, style)
-            production.set_output({"status": unit["status"], "candidate": unit.get("candidate"), "error": unit.get("error")})
+        _produce_item(service, pid, job, catalog, unit, task, style, saved_voice=saved_voice)
     state = asset_work_state(service, pid)
     affected = {_key(i["subject_id"],i["purpose"]) for i in targets}
     incomplete = any(u["status"] == "needs_attention" and
@@ -457,11 +506,12 @@ def _run_asset_order(service, job, order):
             "summary": f"已处理 {len(targets)} 项资产，{state['counts'].get('approved',0)} 项已选用，"
                        f"{state['counts'].get('needs_attention',0)} 项待处理。"}
     if incomplete:
-        from pianchang.asset_diagnostics import asset_diagnostic
+        from pianchang.asset_diagnostics import asset_diagnostic, asset_failure_summary
         names = {e["id"]: e["name"] for e in catalog["entities"]}
         issues = [asset_diagnostic(u, names.get(u["subject_id"]), span_id=u.get("error_span_id"))
                   for u in state["items"] if u["status"] == "needs_attention"
                   and (job["kind"] == "asset_production" or _key(u["subject_id"], u["purpose"]) in affected)]
+        result["summary"] = asset_failure_summary(result["summary"], issues)
         result["asset_diagnostics"] = {"project_id": pid, "summary": result["summary"], "items": issues}
         event("studio.assets.unresolved", result["asset_diagnostics"], kind="state")
     if job["kind"] != "asset_production" and len(targets) == 1:

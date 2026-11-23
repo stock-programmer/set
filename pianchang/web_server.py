@@ -13,7 +13,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit
-from trace_system import TraceError, get_tracer, traced, use_context
+from trace_system import TraceError, current_context, get_tracer, traced, use_context
 from pianchang.preview_access import PreviewBlocked
 from pianchang.video_execution import StandaloneAgentRetired
 
@@ -232,6 +232,7 @@ def create_server(service, host="127.0.0.1", port=8765, *, progress_only=False):
         def _handle_error(self, exc):
             if isinstance(exc, TraceError):
                 raise exc
+            from pianchang.image_recovery import ImageRecoveryConflict
             if self._active_trace:
                 self._active_trace.event("http.exception", {"type": type(exc).__name__, "message": str(exc)}, kind="error")
             if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError)):
@@ -245,6 +246,8 @@ def create_server(service, host="127.0.0.1", port=8765, *, progress_only=False):
                 self._json(409,{"error":str(exc),"preview_gate":{k:v for k,v in exc.gate.items() if k!="allowed_media"}})
             elif isinstance(exc,StandaloneAgentRetired):
                 self._json(410,{"error":str(exc),"code":"AGENT_ENTRY_MERGED","conversation":exc.conversation})
+            elif isinstance(exc, ImageRecoveryConflict):
+                self._json(409, {"error": str(exc), "code": exc.code})
             elif isinstance(exc, (ValueError, TypeError)):
                 message = service.sanitize(str(exc)) if hasattr(service, "sanitize") else "请求参数无效。"
                 self._json(400, {"error": message})
@@ -287,9 +290,10 @@ def create_server(service, host="127.0.0.1", port=8765, *, progress_only=False):
                 sid, digest = params["shot_id"][0], params["sha256"][0]
                 if not 0 < len(sid) <= 128 or not re.fullmatch(r"[a-f0-9]{64}", digest):
                     raise ValueError("镜头或候选版本无效。")
-                job = progress_source.job(pid, job_id)
-                clip = resolve_production_clip(progress_source.root, pid, job, sid, digest,
-                                               video_root=progress_source.video_root,state_dir=progress_source.state_dir)
+                with tracer.read_batch():
+                    job = progress_source.job(pid, job_id)
+                    clip = resolve_production_clip(progress_source.root, pid, job, sid, digest,
+                                                   video_root=progress_source.video_root,state_dir=progress_source.state_dir)
                 self._file(clip, ranges=True, mime="video/mp4")
                 return
             def preview_url(sid, digest):
@@ -366,6 +370,15 @@ def create_server(service, host="127.0.0.1", port=8765, *, progress_only=False):
                         result = studio_video_detail(service, path.split("/")[3])
                         body = self._prepare_json(200, result)
                     self._send_json(200, body)
+                elif re.fullmatch(r"/api/projects/[a-f0-9]{16}/studio/shot-reviews", path):
+                    from pianchang.shot_approval import shot_review_panel
+                    query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                    if set(query) != {"request_id"} or len(query["request_id"]) != 1 or not re.fullmatch(r"[0-9a-f]{32}", query["request_id"][0]):
+                        raise ValueError("请指定要审看的制作委托。")
+                    with tracer.read_batch():
+                        result = shot_review_panel(service, path.split("/")[3], query["request_id"][0])
+                        data = self._prepare_json(200, result)
+                    self._send_json(200, data)
                 elif path=="/api/workspace":
                     from pianchang.workspace_read import workspace_snapshot
                     query=parse_qs(urlsplit(self.path).query,keep_blank_values=True)
@@ -414,6 +427,13 @@ def create_server(service, host="127.0.0.1", port=8765, *, progress_only=False):
                     role=args.pop("role",["script"])
                     if len(role)!=1 or any(len(v)!=1 for v in args.values()):raise ValueError("会话参数无效")
                     self._json(200,get_sessions(service).view({k:v[0] for k,v in args.items()},role[0]))
+                elif path == "/api/feedback-watch":
+                    query=parse_qs(urlsplit(self.path).query,keep_blank_values=True)
+                    ids=query.get("job",[])
+                    if (set(query)!={"job"} or not 1<=len(ids)<=24
+                            or not all(re.fullmatch(r"[a-f0-9]{32}",jid) for jid in ids)):
+                        raise ValueError("请指定要查看的任务 ID。")
+                    self._json(200,_feedback_status(service.root, ids))
                 elif path == "/api/jobs":
                     with tracer.read_batch():result={"jobs":service.list_jobs()}
                     self._json(200, result)
@@ -501,6 +521,8 @@ def create_server(service, host="127.0.0.1", port=8765, *, progress_only=False):
                 length = int(lengths[0])
                 path = self._path()
                 upload = bool(re.fullmatch(r"/api/projects/[\w-]+/studio/references", path))
+                feedback_input = re.fullmatch(
+                    r"/api/(?:projects/(?P<project>[a-f0-9]{16})|story-drafts/(?P<story>[a-f0-9]{32}))/feedback-input", path)
                 limit = 12 * 1024 * 1024 if upload else (1024 * 1024 if path == "/api/studio/scripts" else MAX_BODY)
                 if not 0 < length <= limit:
                     self.close_connection = True
@@ -510,6 +532,10 @@ def create_server(service, host="127.0.0.1", port=8765, *, progress_only=False):
                 captured = {"captured_wire_sha256": hashlib.sha256(raw_body).hexdigest(), "bytes": len(raw_body)}
                 if upload:
                     captured["binary_capture"] = "upload represented by wire digest and verified media digest"
+                elif feedback_input:
+                    # Unvalidated text can contain credentials pasted in error. The accepted,
+                    # typed answer is traced by the service before it is handed to the watcher.
+                    captured["body_representation"] = "wire digest; accepted fields in workbench.feedback.reply.accepted"
                 else:
                     captured.update(body_text=raw_body.decode("utf-8", errors="replace"), text_encoding="utf-8-with-replacement")
                 self._active_trace.event("http.request.body", captured, kind="http")
@@ -517,25 +543,39 @@ def create_server(service, host="127.0.0.1", port=8765, *, progress_only=False):
                 if not isinstance(body, dict):
                     raise ValueError("请求必须为 JSON 对象。")
                 key = self.headers.get("Idempotency-Key")
+                if path == "/api/pi/script-input":
+                    from pi_bridge.service import get_sessions
+                    from tools.workbench_loop_script import accept_script_reply
+                    self._json(202, accept_script_reply(get_sessions(service), body))
+                    return
+                if feedback_input:
+                    from tools.workbench_loop_input import answer_request
+                    self._json(202, answer_request(service.root, feedback_input["project"], body,
+                                                   story_id=feedback_input["story"]))
+                    return
                 if path in {"/api/pi/messages","/api/pi/stop"}:
                     from pi_bridge.service import get_sessions
-                    allowed={"scope","role"} if path.endswith("/stop") else {"scope","role","text","message_id","mode"}
+                    allowed={"scope","role"} if path.endswith("/stop") else {"scope","role","text","message_id","mode","continue_commission"}
                     if set(body)-allowed:raise ValueError("会话请求包含未知字段")
                     sessions=get_sessions(service)
                     result=(sessions.stop(body["scope"],body["role"]) if path.endswith("/stop") else
-                            sessions.submit(body["scope"],body["role"],body["text"],body.get("message_id"),mode=body.get("mode","work")))
+                            sessions.submit(body["scope"],body["role"],body["text"],body.get("message_id"),
+                                            mode=body.get("mode","work"),continue_commission=body.get("continue_commission")))
                     self._json(202,result)
                     return
                 if path == "/api/studio/scripts":
                     self._json(202, {"job": service.submit("studio_script", None, body, key)})
                     return
-                studio = re.fullmatch(r"/api/projects/([\w-]+)/studio/(references|bindings|video|review|review-confirm|generate-reference|asset-production|asset-regenerate|asset-approve|asset-inspect|assets/approve)", path)
+                studio = re.fullmatch(r"/api/projects/([\w-]+)/studio/(references|bindings|video|review|review-confirm|shots/approve|generate-reference|asset-production|asset-regenerate|asset-approve|asset-inspect|assets/approve)", path)
                 if studio:
                     from pianchang.studio_assets import bind_studio_reference, upload_studio_reference
                     pid, action = studio.groups()
                     if action == "review-confirm":
                         from pianchang.studio_recovery import confirm_review
                         self._json(200, confirm_review(service, pid, body))
+                    elif action == "shots/approve":
+                        from pianchang.shot_approval import approve_shot
+                        self._json(200, approve_shot(service, pid, body))
                     elif action == "review":
                         self._json(202, {"job": service.submit("studio_review", pid, body, key)})
                     elif action == "references":
@@ -632,6 +672,27 @@ def _start_listener(port):
     return service, server
 
 
+@traced("workbench.watch.public_status",kind="tool",capture_inputs=False,capture_output=False)
+def _feedback_status(root, ids):
+    from tools.workbench_loop_watch import watch_status
+    return {"jobs":{jid:watch_status(root,jid) for jid in dict.fromkeys(ids)}}
+
+
+def _keep_feedback_watcher(service, stop, generation, context):
+    from tools.workbench_loop_watch import mark_trace_pause, start_watcher, watcher_alive, watcher_paused
+    from tools.workbench_loop_trace_recovery import reconcile_readonly_pause
+    with use_context(context,tracer=service.tracer):
+        while not stop.wait(30):
+            try:
+                if watcher_paused(service.root) and not reconcile_readonly_pause(service.root):
+                    continue
+                if not watcher_alive(service.root):
+                    start_watcher(service.root,generation=generation)
+            except TraceError:
+                mark_trace_pause(service.root)
+                return
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8765)
@@ -639,6 +700,13 @@ def main():
     context = os.environ.pop("PIANCHANG_START_CONTEXT", "")
     with use_context(json.loads(context) if context else None, tracer=get_tracer(ROOT / "outputs/traces")):
         service, server = _start_listener(args.port)
+        from tools.workbench_loop_watch import start_watcher
+        generation=f"server-{os.getpid()}"
+        feedback=start_watcher(service.root,generation=generation)
+        if feedback.get("status")!="paused":
+            threading.Thread(target=_keep_feedback_watcher,
+                             args=(service,server.live_stop,generation,current_context()),
+                             daemon=True,name="feedback-watch-supervisor").start()
     print(f"片场已启动，可访问 http://127.0.0.1:{server.server_address[1]}", flush=True)
     scan = None
     try:

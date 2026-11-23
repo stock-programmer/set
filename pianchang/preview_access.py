@@ -34,6 +34,9 @@ def preview_status(service,pid):
             jobs=list(raw_jobs) if raw_jobs is not None else service.list_jobs()
             active=[j["id"] for j in jobs if j.get("project_id")==pid and j.get("kind") in
                 {"studio_video","studio_review","asset_production","asset_regenerate"} and j.get("status") in {"queued","running"}]
+            if package and package.get("manual_approvals"):
+                from pianchang.shot_approval import active_production
+                active = [j["id"] for j in jobs if active_production([j], pid, package["request_id"])]
         check("production.active_changes",[],active)
         if view.get("production_ref"):
             from pianchang.studio_recovery import read_incomplete_production
@@ -48,10 +51,22 @@ def preview_status(service,pid):
             check("production.media_accepted",True,package.get("media_accepted"))
             check("production.project",digest_json(view["project"]),digest_json(package["project"]))
             check("production.script_ref",view.get("script_ref"),package.get("script_ref"))
-            check("production.spec_ref",view.get("spec"),package.get("spec_ref"))
+            if package.get("spec_ref") is None:
+                # Older worker packages pinned the exact specification as an immutable dependency.
+                check("production.spec_dependency", [{k:view["spec"][k] for k in ("asset_id","revision_id")}],
+                      view.get("published_spec_dependencies", []))
+            else:
+                check("production.spec_ref",view.get("spec"),package["spec_ref"])
             # Run the existing exact validator against immutable receipts. No
             # Agent, model, repair operation or renderer is started by this read.
             evidence=SimpleNamespace(project=package["project"],shots=package["shots"],reports=package["reports"])
+            if package.get("manual_approvals"):
+                from pianchang.shot_approval import read_approvals
+                from pianchang.studio_recovery import _work
+                evidence.request_id = package["request_id"]
+                decisions = read_approvals(_work(view, evidence.request_id), evidence.project, evidence.shots, evidence.reports, project_id=pid)
+                check("production.manual_approvals", package["manual_approvals"], decisions)
+                evidence.manual_approvals = decisions
             from pianchang.video_collab_agent import VideoWorkspace
             acceptance=VideoWorkspace.acceptance_gate(evidence)
             issues=acceptance["issues"]
@@ -78,6 +93,7 @@ def preview_status(service,pid):
     return {"ready":ready,"status":"ready_for_preview" if ready else "production_incomplete",
         "reason":"全部镜头及衔接必过项通过，可预览整片。" if ready else "必过验收或当前版本交付尚未完成。可在视频制作页预览已生成的镜头并查看验收记录。",
         "project_id":pid,"production_ref":view.get("production_ref"),"script_ref":view.get("script_ref"),"spec_ref":view.get("spec"),
+        "request_id":package.get("request_id") if ready else None,
         "total":len(view.get("project",{}).get("shots",[])),"checks":checks,"issues":issues,
         "preview":preview if ready else None,"allowed_media":allowed if ready else {}}
 

@@ -93,6 +93,13 @@ set of SQLite connections. Each normal event still commits with
 connections, while in-flight connections close when their operations finish.
 The SDK still has no dependency on this application's server or media modules.
 
+Writers in the same process and database share a FIFO queue, including separate
+`Tracer` instances and read-batch commits. A waiting background task gets its
+turn before newer page-refresh writes, instead of repeatedly competing for
+SQLite's writer lock. Database reads do not enter this queue. SQLite still
+coordinates other processes with its bounded busy timeout; storage failures
+remain `TraceError` and never cause a provider operation to be replayed.
+
 `with tracer.read_batch():` is restricted to pure read computations under an
 already durable root. It stages redacted observations, preserving their actual
 timestamps, and commits the complete ordered batch before the scope returns.
@@ -106,3 +113,17 @@ received request's root incomplete. Provider calls, domain mutations, background
 dispatch and sending the HTTP response must stay outside this scope. In this
 workbench, Pi session creation and all generation/mutation requests retain
 immediate tracing. This is not an asynchronous queue for paid-call logs.
+
+When SQLite rejects a read batch's `BEGIN IMMEDIATE` with `SQLITE_BUSY`,
+the SDK can attach `read_batch_before_begin` to the owning span's durable
+error record. It describes the staged span relationships and operation names.
+This evidence requires a normally completed read body, a single trace and at
+most 1,024 staged operations. The original batch still fails. A supervisor
+can inspect the error and verify its trace before repeating a known read.
+
+On Windows, SDK writers in the same desktop session acquire a kernel mutex
+named for the resolved store path after joining their process-local writer
+queue. The mutex covers the SQLite transaction and its synchronous commit.
+Independent reads continue through WAL. If the owner exits, Windows releases
+the mutex and SQLite recovers its transaction. A writer that cannot acquire
+the mutex within 30 seconds raises `TraceError` before beginning a write.

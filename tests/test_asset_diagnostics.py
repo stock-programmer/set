@@ -1,7 +1,7 @@
 """Read-only projections over offline asset-agent records."""
 import unittest
 
-from pianchang.asset_diagnostics import asset_diagnostic
+from pianchang.asset_diagnostics import asset_diagnostic, current_image_access_guidance
 
 
 class AssetDiagnosticTests(unittest.TestCase):
@@ -50,6 +50,25 @@ class AssetDiagnosticTests(unittest.TestCase):
         self.assertNotIn("重新生成", asset_diagnostic(item)["action"])
         item["error"] = "百炼生图返回 HTTP 403。"
         self.assertEqual(asset_diagnostic(item)["stage"], "generate")
+
+    def test_old_image_model_404_is_distinct_from_other_failed_calls(self):
+        model = "doubao-seedream-5-0-260128"
+        error = f"Error code: 404 - The model or endpoint {model} does not exist or you do not have access to it."
+        item = {"status": "needs_attention", "purpose": "portrait", "error": error}
+        diagnosis = asset_diagnostic(item)
+        self.assertEqual((diagnosis["code"], diagnosis["model_id"], diagnosis["stage"], diagnosis["verdict"]),
+                         ("image_model_access", model, "generate", "FAIL"))
+        self.assertIn("回应请求", diagnosis["action"])
+        recorded = {"summary": "历史原因。逐项重新生成。", "items": [{**diagnosis, "action": "逐项重新生成。"}]}
+        view = current_image_access_guidance(recorded)
+        self.assertIn("回应请求", view["summary"])
+        self.assertEqual(view["items"][0]["action"], diagnosis["action"])
+        self.assertEqual(recorded["summary"], "历史原因。逐项重新生成。")
+        for update in ({"purpose": "voice"}, {"error": error.replace(model, "text-model")},
+                       {"error": error.replace("404", "503")}, {"error": "HTTP 404 - Image file missing"},
+                       {"error": error[:64]}, {"rejected_image_model": None}):
+            with self.subTest(update=update):
+                self.assertNotIn("code", asset_diagnostic({**item, **update}))
 
     def test_stale_review_or_legacy_missing_cause_does_not_get_attributed(self):
         faulty = {"path": "palette", "status": "FAIL", "actual": "属于旧候选的红色。"}

@@ -120,9 +120,14 @@ class PiRuntimeTests(unittest.TestCase):
                 self.assertTrue(Path(first["session_file"]).is_file())
                 self.assertIn("[message_id="+"a"*32+"]",Path(first["session_file"]).read_text("utf-8"))
                 prior_count=len(requests)
+                from pianchang.model_routes import ModelRoute
+                new_route = ModelRoute("litellm", "openai", "offline", "https://api.openai.com/v1", "gpt-5.4",
+                                       "offline-resume-key", sdk_provider="openai", connection="offline-openai")
                 second=PiLoop(client,[tool],root/"second",system_prompt=role_prompt,session_file=first["session_file"],snapshot=lambda:{"offline":True},
-                    finish_check=lambda:{"complete":True,"summary":"offline follow-up"}).run("结合刚才的证据继续回答",max_steps=4)
+                    model_route=new_route, finish_check=lambda:{"complete":True,"summary":"offline follow-up"}).run("结合刚才的证据继续回答",max_steps=4)
                 self.assertEqual(second["session_id"],first["session_id"])
+                self.assertEqual(requests[prior_count]["model"], new_route.model_id)
+                self.assertEqual(requests[prior_count]["max_completion_tokens"], client.config.max_tokens)
                 self.assertGreater(len(requests[prior_count]["messages"]),len(requests[0]["messages"]))
                 self.assertEqual(len(calls),1,"A follow-up must not replay the old tool")
                 for payload in (requests[0], requests[prior_count]):

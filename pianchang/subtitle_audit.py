@@ -10,8 +10,9 @@ import json
 from pathlib import Path
 from urllib import request
 
-from pianchang.bailian_observer import BailianObserver, _frame_part
+from pianchang.bailian_observer import BailianObserver, _frame_part, vision_output_options
 from pianchang.bailian_text import TextError
+from pianchang.review_dispatch import ReviewOutOfScope
 from pianchang.story_spec import digest_json
 from trace_system import TraceError, register_secret, traced
 
@@ -31,7 +32,9 @@ class SubtitleFrameObserver(BailianObserver):
         parts=[{"type":"text","text":"请按指定JSON结构抄录以下实际图片中的叙事字幕；不提供要比对的目标文字。"}]
         for frame in frames:parts.extend(_frame_part(frame)[1])
         payload={"model":self.config.model,"messages":[{"role":"system","content":PROMPT},{"role":"user","content":parts}],
-                 "stream":False,"max_tokens":320,"temperature":0,"enable_thinking":False,"response_format":{"type":"json_object"}}
+                 "stream":False,**vision_output_options(self.config, 1024 if getattr(self.config,"adapter","") == "openai" else 320),"response_format":{"type":"json_object"}}
+        if getattr(self.config,"adapter","") != "openai":
+            payload["temperature"] = 0
         req=request.Request(self.config.base_url+"/chat/completions",data=json.dumps(payload,ensure_ascii=False).encode("utf8"),
                             headers={"Authorization":"Bearer "+self.config.api_key,"Content-Type":"application/json"},method="POST")
         body,header=self._post(req)
@@ -129,6 +132,7 @@ def audit_subtitle_frames(config,clip,video,criterion,context,directory,previous
                    "observation":"实际图片字幕读取："+text} for f in model_frames]
         if wrong_rendering:evidence.append({**_asset(rendering["receipt"]["path"]),"type":"render_receipt","observation":"实际烧录文字："+rendering["text"]})
     except TraceError:raise
+    except ReviewOutOfScope:return previous
     except (ValueError,KeyError,TypeError,OSError,TextError) as exc:
         error=str(exc);status="UNKNOWN";text=None;evidence=[]
         reason="已尝试独立的原始分辨率图片文字读取，但未取得有效结果："+error+"；保留原检查及调用记录，未冒认通过。"

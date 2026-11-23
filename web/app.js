@@ -318,7 +318,8 @@ function setStep(step) {
   const target=productionRoute(step,state.projectId?studioLocal(state.projectId).section:null);
   state.step=target.step;
   if(state.projectId){studioLocal(state.projectId).section=target.section;studioLocal(state.projectId).tool=target.tool;}
-  if(state.projectId && switchProjectRead(state.projectId)) return;
+  const projectRead = state.projectId && switchProjectRead(state.projectId);
+  if (projectRead) return projectRead;
   renderHeader(); renderStage(); persistRoute();
   announce(`已切换到${STEP_NAMES[currentPhase()]}`);
 }
@@ -490,7 +491,374 @@ function assetDecisionKey(candidate, review) {
   if (![candidate, review].every(pin => pin?.asset_id && pin.revision_id && pin.sha256)) return null;
   return JSON.stringify([candidate.asset_id, candidate.revision_id, candidate.sha256, review.asset_id, review.revision_id, review.sha256]);
 }
+let feedbackReading = false, feedbackReadAt = 0;
+let feedbackJobs = {};
+const shownFeedbackRequests = new Set();
+const acceptedFeedbackRequests = new Set();
+const pendingFeedbackAnswers = new Set();
+const feedbackNavigation = new Map([
+  ["confirm_video_plan", "查看拍摄计划"],
+  ["confirm_commission_budget", "查看后续计划"],
+  ["review_retake_limit", "审看镜头"],
+  ["review_commission_shots", "审看镜头与报告"],
+  ["inspect_commission_reports", "查看镜头与阻塞原因"],
+  ["review_asset_candidates", "查看待审参考图"],
+]);
+
+function requestedAssetCandidates(prompt, data) {
+  if (!Array.isArray(prompt.items)) return [];
+  return (data?.asset_work?.items || []).filter(item => {
+    const review = item.review, pin = item.candidate;
+    return item.job_id && item.status === "needs_attention" && !item.selected_pin && pin?.revision_id &&
+      review?.review_ref?.sha256 && !review.observation_error && ["FAIL","UNKNOWN"].includes(review.verdict || review.status) &&
+      prompt.items.some(target => target && (target.candidate_job_id ?? prompt.candidate_job_id) === item.job_id &&
+        target.subject_id === item.subject_id && target.purpose === item.purpose && target.revision_id === pin.revision_id &&
+        (target.asset_id === undefined || target.asset_id === pin.asset_id) &&
+        (target.sha256 === undefined || target.sha256 === pin.sha256) &&
+        (target.review_ref === undefined || (target.review_ref?.sha256 &&
+          Object.keys(target.review_ref).every(key => target.review_ref[key] === review.review_ref[key]))));
+  });
+}
+
+function activeCommissionReview(projectId, commissionId) {
+  return commissionId && state.jobs.find(job => job.kind === "studio_review" && job.project_id === projectId &&
+    job.review_request_id === commissionId && ACTIVE.has(job.status));
+}
+
+function reviewProgress(review) {
+  return review.status === "queued" ? "本次委托的自动复验已排队。" : "正在自动复验本次委托的镜头与验收报告。";
+}
+
+function feedbackScopeMatches(prompt, data) {
+  if (!feedbackNavigation.has(prompt.kind)) return true;
+  if (data?.project_id && data.project_id !== prompt.project_id) return false;
+  if (activeCommissionReview(prompt.project_id, prompt.commission_id)) return false;
+  if (prompt.kind === "review_asset_candidates") {
+    if (!Array.isArray(prompt.items) || !prompt.items.some(target =>
+      target?.revision_id && target.subject_id && target.purpose && (target.candidate_job_id ?? prompt.candidate_job_id))) return false;
+    // The video projection has no assets. Navigation loads and rechecks the full workspace.
+    return data?.projection === "video" || requestedAssetCandidates(prompt, data).length > 0;
+  }
+  const spec = data?.assets?.spec || data?.catalog?.spec;
+  if (prompt.spec_revision && spec?.revision_id !== prompt.spec_revision) return false;
+  if (prompt.commission_id && prompt.commission_id !==
+      (data?.video_execution?.commission_id || data?.incomplete_production?.request_id)) return false;
+  if (prompt.proposal_id && data?.projection !== "video" && data?.video_plan?.extra_retake?.proposal_id !== prompt.proposal_id) return false;
+  if (prompt.exhausted_budget) {
+    const expected = prompt.exhausted_budget, actual = data?.video_execution?.exhausted_budget;
+    if (!actual || expected.kind !== actual.kind || expected.limit !== actual.limit || expected.used !== actual.used) return false;
+  }
+  if (!prompt.plan_id) return true;
+  const currentPlan = data?.video_plan?.plan_id;
+  return currentPlan === prompt.plan_id || (data?.projection === "video" && !currentPlan);
+}
+
+function scriptFeedbackRole(draftId, pid) {
+  const chat = typeof agentChatCurrent !== "undefined" && agentChatCurrent;
+  if (chat?.host?.isConnected !== false && chat?.view?.role &&
+      (draftId ? chat.scope?.story === draftId : chat.scope?.project === pid)) return chat.view.role === "script";
+  return currentPhase() === "story";
+}
+
+function currentFeedbackRequests() {
+  const draftId = state.storyDraftId, pid = draftId ? null : state.projectId;
+  if ((!pid && !draftId) || state.loading || state.creating || state.step === "traces") return [];
+  const requests = [], data = typeof studioViews !== "undefined" && pid && studioViews.get(pid)?.data;
+  for (const job of visibleJobs()) {
+    const info = feedbackJobs[job.id], prompt = info?.human_request;
+    if (info?.status !== "needs_input" || !prompt?.id || !prompt.title ||
+        (prompt.job_id && prompt.job_id !== job.id)) continue;
+    if (prompt.kind === "script_creative_input") {
+      if (!["studio_script","pi_script"].includes(job.kind) || (prompt.role && prompt.role !== "script") ||
+          !scriptFeedbackRole(draftId,pid)) continue;
+    }
+    const sourceStory = prompt.story_job_id || prompt.story_id;
+    if (draftId) {
+      if (prompt.kind !== "script_creative_input" || !/^[a-f0-9]{32}$/.test(draftId) || sourceStory !== draftId ||
+          (prompt.project_id && prompt.project_id !== (jobProjectId(job) || state.storyDraft?.project_id))) continue;
+    } else if (prompt.project_id !== pid || !feedbackScopeMatches(prompt,data)) continue;
+    const scope = prompt.project_id ? "/api/projects/" + encodeURIComponent(prompt.project_id) :
+      "/api/story-drafts/" + encodeURIComponent(draftId);
+    const key = JSON.stringify([scope, job.id, prompt.id]);
+    if (!acceptedFeedbackRequests.has(key)) requests.push({pid, draftId, scope, jobId:job.id, key, prompt});
+  }
+  return requests;
+}
+
+async function openFeedbackDestination(entry) {
+  const {pid, prompt} = entry, kind = prompt.kind;
+  if (state.projectId !== pid || state.storyDraftId || state.creating) return;
+  if (kind === "review_asset_candidates") {
+    await setStep("assets");
+    if (state.projectId !== pid || currentPhase() !== "assets") return;
+    const current = requestedAssetCandidates(prompt, studioLocal(pid).data);
+    const row = [...document.querySelectorAll(".studio-asset-problem")].find(({dataset}) =>
+      current.some(item => item.job_id === dataset.assetJobId && item.subject_id === dataset.subjectId &&
+        item.purpose === dataset.purpose && item.candidate.revision_id === dataset.revisionId &&
+        item.candidate.asset_id === (dataset.assetId || undefined) &&
+        item.candidate.sha256 === (dataset.candidateSha || undefined) && item.review.review_ref.sha256 === dataset.reviewSha));
+    if (row) {
+      const evidence = row.querySelector?.("details");
+      if (evidence) evidence.open = true;
+      row.focus({preventScroll:true});
+      row.scrollIntoView?.({block:"start"});
+    }
+    return;
+  }
+  await setStep("video");
+  if (state.projectId !== pid || currentPhase() !== "video") return;
+  const view = studioLocal(pid);
+  const planAction = ["confirm_video_plan","confirm_commission_budget"].includes(kind);
+  if (planAction && view.data?.projection === "video" && view.data.video_execution?.commission_id)
+    await openProject(pid,{preserveStep:true, full:true});
+  if (state.projectId !== pid || currentPhase() !== "video" || !feedbackScopeMatches(prompt, view.data)) return;
+  if (["review_retake_limit","review_commission_shots","inspect_commission_reports"].includes(kind)) {
+    const commission = view.data?.video_execution?.commission_id;
+    if (commission !== prompt.commission_id) return;
+    await studioReadShotReviews(pid, commission);
+    if (state.projectId !== pid || currentPhase() !== "video" || view.data?.video_execution?.commission_id !== commission) return;
+    const scope = [...document.querySelectorAll(".studio-shot-approvals")].find(el => el.dataset.requestId === commission);
+    if (!scope) return;
+    const row = [...scope.querySelectorAll("article")].find(el => prompt.review_shots?.some(pin =>
+      el.dataset.shotId === pin.shot_id && el.dataset.mediaSha === (pin.media_sha256 || "") && el.dataset.reportSha === (pin.report_sha256 || "")));
+    if (!row && prompt.review_shots?.length) {
+      scope.prepend?.(note("原提示中的镜头或报告版本已更新，请查看此委托当前的阻塞原因。"));
+    }
+    const target = row || scope;
+    const report = row?.querySelector?.('.studio-take[data-selected="true"] .studio-take-report');
+    if (report) report.open = true;
+    target.focus?.({preventScroll:true}); target.scrollIntoView?.({block:"start"});
+    return;
+  }
+  if (state.projectId === pid) document.querySelector?.(planAction ?
+    ".studio-video-plan" : ".studio-shot-approvals")?.scrollIntoView?.({block:"start"});
+}
+
+function feedbackInput(field) {
+  const label = node("label","feedback-field");
+  const input = node(field.type === "select" ? "select" : "input");
+  input.name = field.name;
+  input.required = field.required !== false;
+  if (field.type === "confirm") {
+    input.type = "checkbox";
+    input.checked = false;
+    input.autocomplete = "off";
+    label.className += " feedback-field-confirm";
+    label.append(input, node("span","",field.label));
+  } else {
+    if (field.type === "select") {
+      const placeholder = node("option","","请选择");
+      placeholder.value = "";
+      input.append(placeholder);
+      for (const option of field.options || []) {
+        const row = node("option","",option.label);
+        row.value = option.value;
+        input.append(row);
+      }
+    } else {
+      input.type = "text";
+      input.autocomplete = "off";
+      if (field.name === "endpoint_id") {
+        input.pattern = "ep-[A-Za-z0-9][A-Za-z0-9\\-]{1,123}";
+        input.title = "请填写 ep- 开头的方舟接入点 ID";
+      }
+      if (field.placeholder) input.placeholder = field.placeholder;
+      if (Number.isInteger(field.max_length) && field.max_length > 0) input.maxLength = field.max_length;
+    }
+    label.append(node("span","",field.label), input);
+  }
+  if (field.hint) label.append(node("small","small-print",field.hint));
+  return {label, input, type:field.type};
+}
+
+function openFeedbackRequest(entry) {
+  const {pid, jobId, key, prompt} = entry;
+  if (!currentFeedbackRequests().some(row => row.key === key)) return;
+  const dialog = $("asset-intervention-dialog");
+  const fields = Array.isArray(prompt.fields) ? prompt.fields : [];
+  const batchRevision = prompt.kind === "review_asset_candidates" && fields.length > 0;
+  if (dialog.dataset.request === key && (dialog.open || !batchRevision || pendingFeedbackAnswers.has(key))) {
+    if (!dialog.open) dialog.showModal();
+    return;
+  }
+  const heading = node("h2","",prompt.title);
+  heading.id = "asset-intervention-title";
+  dialog.dataset.request = key;
+  const actions = node("div","studio-actions");
+  const later = button("稍后处理", () => dialog.close(), {quiet:true});
+  const children = [heading, node("p","feedback-message",prompt.message)];
+  if (feedbackNavigation.has(prompt.kind)) {
+    const navigationLabel = prompt.navigation_label || (!batchRevision && prompt.submit_label) || feedbackNavigation.get(prompt.kind);
+    actions.append(button(navigationLabel, () => {
+      dialog.close();
+      if (currentFeedbackRequests().some(row => row.key === key)) void openFeedbackDestination(entry);
+    }, {primary:!batchRevision}));
+  }
+  if (feedbackNavigation.has(prompt.kind) && !batchRevision) {
+    actions.append(later);
+    children.push(actions);
+  } else {
+    const form = node("form","feedback-form");
+    const supported = fields.length > 0 && fields.every(f => f?.name && f.label && ["confirm","select","text"].includes(f.type)) &&
+      (!batchRevision || fields.some(f => f.name === "authorize_revision" && f.type === "confirm"));
+    const controls = supported ? fields.map(feedbackInput) : [];
+    const authorization = controls.find(row => row.input.name === "authorize_revision")?.input;
+    const error = node("p","feedback-error");
+    error.setAttribute("role","alert");
+    const submit = node("button","button button-primary",prompt.submit_label || "提交并继续");
+    submit.type = "submit";
+    const updateSubmit = () => {submit.disabled = !supported || pendingFeedbackAnswers.has(key) || (batchRevision && !authorization?.checked);};
+    updateSubmit();
+    if (batchRevision && authorization) authorization.addEventListener("change", updateSubmit);
+    if (!supported) error.textContent = "此请求需要更新工作台页面，请刷新后再试。";
+    actions.append(submit, later);
+    form.append(...controls.map(row => row.label), error, actions);
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      if (!supported || pendingFeedbackAnswers.has(key) || (batchRevision && !authorization?.checked) ||
+          !currentFeedbackRequests().some(row => row.key === key)) return;
+      const answers = Object.fromEntries(controls.map(({input,type}) =>
+        [input.name, type === "confirm" ? input.checked : input.value.trim()]));
+      if (!Object.values(answers).some(Boolean)) {
+        error.textContent = "请填写一项答复或勾选确认后继续。";
+        return;
+      }
+      pendingFeedbackAnswers.add(key);
+      submit.disabled = true;
+      error.textContent = "";
+      try {
+        await request(entry.scope + "/feedback-input",
+          {method:"POST",body:{job_id:jobId,request_id:prompt.id,answers}});
+        acceptedFeedbackRequests.add(key);
+        if (dialog.dataset.request === key) dialog.close();
+        if (entry.draftId ? state.storyDraftId === entry.draftId : state.projectId === pid && !state.storyDraftId)
+          toast("旁路已收到答复，正在继续处理。");
+      } catch (failure) {
+        error.textContent = failure.message;
+      } finally {
+        pendingFeedbackAnswers.delete(key);
+        updateSubmit();
+        feedbackReadAt = 0;
+        renderFeedbackRequests();
+        void refreshFeedbackJobs();
+      }
+    });
+    children.push(form);
+  }
+  dialog.replaceChildren(...children);
+  if (!dialog.open) dialog.showModal();
+  shownFeedbackRequests.add(key);
+  try { window.sessionStorage.setItem("pianchang.feedback." + key, "1"); } catch {}
+}
+
+function renderFeedbackRequests() {
+  const card = $("asset-intervention"), dialog = $("asset-intervention-dialog");
+  const requests = currentFeedbackRequests();
+  if (dialog.dataset.request && !requests.some(row => row.key === dialog.dataset.request)) {
+    if (dialog.open) dialog.close();
+    delete dialog.dataset.request;
+    dialog.replaceChildren();
+  }
+  const signature = JSON.stringify(requests.map(row => row.key));
+  if (card.dataset.signature === signature) return;
+  card.dataset.signature = signature;
+  card.hidden = !requests.length;
+  card.replaceChildren();
+  for (const row of requests) {
+    const action = button("回应请求", () => openFeedbackRequest(row), {small:true});
+    card.append(node("h3","",row.prompt.title), node("p","feedback-message",row.prompt.message), action);
+  }
+  if (dialog.open || window.pianchangFeedbackObserver) return;
+  const unseen = requests.find(({key}) => {
+    if (shownFeedbackRequests.has(key)) return false;
+    try { return window.sessionStorage.getItem("pianchang.feedback." + key) !== "1"; } catch { return true; }
+  });
+  if (unseen) openFeedbackRequest(unseen);
+}
+
+function feedbackText(info, job) {
+  const review = job && ["pi_video","studio_video"].includes(job.kind) &&
+    activeCommissionReview(job.project_id, job.commission_id || job.message_id);
+  if (review) return reviewProgress(review);
+  if (!info) return "暂时无法读取旁路状态";
+  const labels = {queued:"异常已入队",handling:"正在跟踪修复",succeeded:"已复验通过",
+    blocked:"推进受阻",unknown:"结果待核对",awaiting_evidence:"等待依赖就绪",needs_input:"需要你处理",
+    historical:"历史记录",untracked:"尚未接管",watching:"监听中",cleared:"依赖复验通过",resolved:"原任务状态已更新"};
+  const parts = [info.running ? "旁路在线" : "旁路未连接", labels[info.status] || "已记录"];
+  if (info.progress_message) return [...parts, info.progress_message].join(" · ");
+  if (info.reason === "acceptance_retake_limit") parts.push("自动重拍已停止，等待人工审看镜头");
+  if (info.triage?.status === "reported") parts.push("已收到 Codex 的故障分析");
+  if (info.triage?.status === "running") parts.push("Codex 正在分析原始故障记录");
+  if (info.triage?.status === "unavailable") parts.push("本地 Codex 未返回诊断回执");
+  const dependency=info.dependency;
+  if (dependency?.human_intervention?.kind === "reference_image_model_access") parts.push("上次生图请求被供应商拒绝");
+  if (Number.isInteger(dependency?.current_shot_count)) parts.push("当前规格 "+dependency.current_shot_count+" 镜头");
+  if (Number.isInteger(dependency?.missing_count)) {
+    parts.push(dependency.missing_count ? "当前仍缺 "+dependency.missing_count+" 项镜头参考" : "参考门禁已通过");
+  }
+  for (const ref of dependency?.missing_references || []) {
+    parts.push([ref.shot_id, ref.subject_id, studioPurposes[ref.purpose]].filter(Boolean).join(" / "));
+  }
+  const failure = dependency?.transport_failure;
+  if (failure?.request_kind === "model" && failure.dispatch === "not_sent") {
+    parts.push("已核实原规划请求在连接阶段中断，尚未发送");
+    if (dependency.connectivity?.status === "reachable") {
+      parts.push("规划模型线路已复通");
+      if (info.status === "handling") parts.push("正在按原制作委托续做");
+    } else if (dependency.connectivity?.status === "retry_later") {
+      parts.push("正在等待规划线路恢复，旁路会自动复查");
+    }
+  }
+  if (info.reason === "provider_receipt_unknown" && info.running) {
+    parts.push("旁路会继续核对原请求的发送与受理记录");
+  }
+  if (failure?.request_kind === "audio") {
+    if (failure.dispatch === "not_sent") parts.push("原试音在连接阶段失败，已核实未发送");
+    else if (failure.error_type) parts.push("原试音传输异常 " + failure.error_type);
+    if (dependency.connectivity?.status === "http_response") parts.push("当前语音线路可达");
+  }
+  if (info.voice_recovery_job_id) parts.push("已按原选角提交试音恢复");
+  if (dependency?.voice_review) {
+    parts.push("音频已送达，原听审无法判断");
+    if (info.voice_inspection_job_id) parts.push("已提交同一候选复听");
+  }
+  if (dependency?.receipt_unknown) parts.push("原供应商请求回执待核对");
+  if (dependency?.requires_plan_reconfirmation) parts.push("新版制作计划待确认");
+  return parts.join(" · ");
+}
+function isFeedbackJob(job) {
+  const partial = ["studio_video","pi_video"].includes(job.kind) && job.status === "succeeded" && job.result?.action_required === true &&
+    (job.result.task_complete === false || job.result.extra_retake?.partial);
+  return (["failed", "interrupted"].includes(job.status) || partial) && /^[0-9a-f]{32}$/.test(job.id) &&
+    ["pi_script","studio_script","pi_video","studio_video","asset_production","asset_regenerate",
+      "asset_inspect","asset_approve","studio_reference"].includes(job.kind);
+}
+async function refreshFeedbackJobs() {
+  if (feedbackReading || Date.now() - feedbackReadAt < 5000) return;
+  const ids = visibleJobs().filter(isFeedbackJob).map(job => job.id);
+  if (!ids.length) return;
+  feedbackReading = true;
+  feedbackReadAt = Date.now();
+  try {
+    // An active request can belong to an older task outside the twelve visible task cards.
+    for (let offset = 0; offset < ids.length; offset += 24) {
+      const group = ids.slice(offset, offset + 24);
+      const result = await request("/api/feedback-watch?" + new URLSearchParams(group.map(id => ["job",id])));
+      for (const id of group) feedbackJobs[id] = result.jobs?.[id] || null;
+    }
+  } catch {
+    // Retain the last confirmed state and any answer being typed through a polling outage.
+    for (const id of ids) if (!Object.hasOwn(feedbackJobs,id)) feedbackJobs[id] = null;
+  } finally { feedbackReading = false; }
+  for (const el of document.querySelectorAll("[data-feedback-job]")) {
+    if (ids.includes(el.dataset.feedbackJob)) el.textContent = feedbackText(feedbackJobs[el.dataset.feedbackJob],
+      state.jobs.find(job => job.id === el.dataset.feedbackJob));
+  }
+  renderJobs();
+}
+
 function renderJobs() {
+  renderFeedbackRequests();
   const openingJob = state.projectOpening?.summary.opening?.video_job;
   const onlyOpeningJob = state.jobsReady===false && openingJob?.project_id===state.projectId && openingJob?.kind==="studio_video";
   if(state.jobsReady===false && !onlyOpeningJob){
@@ -515,6 +883,7 @@ function renderJobs() {
   const list = $("job-list");
   const humanDecisions = currentHumanAssetDecisions(projectScope && !draftScope ? state.projectId : null);
   const projectId = projectScope && !draftScope ? state.projectId : null;
+  const execution = projectId && typeof studioViews !== "undefined" ? studioViews.get(projectId)?.data?.video_execution : null;
   const proposal = projectId && typeof studioViews !== "undefined" ? studioViews.get(projectId)?.data?.video_plan?.extra_retake : null;
   const monitor = projectId && typeof studioViews !== "undefined" ? studioViews.get(projectId)?.monitor : null;
   const monitoredJob = monitor && jobs.find(job => job.id===monitor.jobId && job.kind==="studio_video");
@@ -527,10 +896,14 @@ function renderJobs() {
     progressText = sample.recorded ? "上次制作记录（"+stamp+"）：" + sample.text
       : stale ? "上次读取（" + stamp + "）：" + sample.text : sample.text;
   }
-  const signature = JSON.stringify([draftScope ? `draft:${state.storyDraftId}` : projectScope ? state.projectId : "new", [...humanDecisions], proposal?.proposal_id, monitoredJob?.id, progressText, jobs.map((job) => [job.id, job.status, job.updated_at, job.message, job.error, job.result, job.asset_diagnostics, job.trace_id, job.cancel_requested, state.cancelPending.has(job.id)])]);
+  const usage = execution?.usage, limits = execution?.limits;
+  const signature = JSON.stringify([draftScope ? `draft:${state.storyDraftId}` : projectScope ? state.projectId : "new", [...humanDecisions], proposal?.proposal_id, monitoredJob?.id, progressText,
+    execution?.commission_id, execution?.last_execution?.id, usage?.reserved_video_generations, usage?.model_calls, limits?.max_video_generations, limits?.max_model_calls,
+    jobs.map((job) => [job.id, job.status, job.updated_at, job.message, job.error, job.result, job.asset_diagnostics, job.trace_id,
+      feedbackJobs[job.id]?.review_link?.id, job.cancel_requested, state.cancelPending.has(job.id)])]);
   if (list.dataset.signature === signature) return;
   list.dataset.signature = signature; list.replaceChildren();
-  if (proposal?.proposal_id && proposal.shot_ids?.length) {
+  if (proposal?.proposal_id && proposal.shot_ids?.length && !activeCommissionReview(projectId,proposal.partial?.request_id)) {
     const card = node("article","job-card");
     append(card, node("h3","","有镜头等待你同意重拍"),node("p","",proposal.shot_ids.join("、") + " · " + proposal.reason),
       button("查看额外重拍计划", () => {
@@ -550,11 +923,15 @@ function renderJobs() {
     card.dataset.jobId=job.id;
     const heading = node("div", "job-card-top");
     let statusLabel = job.kind === "agent" ? agentResultLabel(job) : { succeeded: "任务完成", failed: "任务失败", interrupted: "已中断", queued: "排队中", running: "进行中" }[job.status];
+    const review = ["pi_video","studio_video"].includes(job.kind) && activeCommissionReview(job.project_id,job.commission_id || job.message_id);
     if(job.kind?.startsWith("pi_")&&job.result?.turn_complete&&!job.result?.task_complete)statusLabel="本轮已回复";
+    if (job.kind === "pi_video" && job.result?.action_required && job.result?.task_complete === false) statusLabel="制作未完成";
     if (job.kind === "studio_video" && job.result?.action_required) {
-      statusLabel = job.result.extra_retake?.proposal_id === proposal?.proposal_id ? "等你决定重拍" : "已提出重拍申请";
+      statusLabel = job.result.extra_retake?.proposal_id ?
+        (job.result.extra_retake.proposal_id === proposal?.proposal_id ? "等你决定重拍" : "已提出重拍申请") : "制作未完成";
     }
-    append(heading, node("h3", "", jobTitle(job)), pill(job.status, statusLabel));
+    if (review) statusLabel = review.status === "queued" ? "自动复验已排队" : "正在自动复验";
+    append(heading, node("h3", "", jobTitle(job)), pill(review ? review.status : job.status, statusLabel));
     const message = ACTIVE.has(job.status) ? job.message || "任务正在后台处理，请稍候。" : job.error ? errorText(job.error) : job.message || "任务记录已保存。";
     const pastAssetReview = !ACTIVE.has(job.status) && ["asset_production","asset_regenerate","asset_inspect","studio_reference"].includes(job.kind)
       && message.includes("待人工确认");
@@ -563,11 +940,46 @@ function renderJobs() {
     const issues = job.asset_diagnostics?.project_id === jobProjectId(job) ? job.asset_diagnostics?.items : null;
     const assetIssues = job.status === "failed" && Array.isArray(issues) && issues.length > 0;
     const displayMessage = pastVideoBudget ? "旧版委托因手填上限停止。可在当前拍摄计划中开始制作。"
-      : pastAssetReview ? "旧流程记录（当时）：" + message : assetIssues ? "任务结束时：" + message : message;
+      : pastAssetReview ? "旧流程记录（当时）：" + message
+      : assetIssues ? "任务结束时：" + (job.asset_diagnostics.summary || message) : message;
     const showProgress = monitoredJob?.id===job.id && progressText;
     const reported = job.kind==="studio_video" && ACTIVE.has(job.status) && job.message ? "任务上报：" + displayMessage : displayMessage;
-    append(card, heading, node("p", "", showProgress || reported));
-    if (showProgress && (job.error || job.result?.action_required)) card.append(node("p","",displayMessage));
+    const continuation = job.kind === "studio_video" && job.message_id && scoped.filter(child =>
+      child.kind === "pi_video" && child.commission_job_id === job.id && child.commission_id === job.message_id &&
+      jobProjectId(child) === jobProjectId(job)).sort((a,b) =>
+        String(b.created_at || b.updated_at || "").localeCompare(String(a.created_at || a.updated_at || "")))[0];
+    append(card, heading, node("p", "", (continuation || review) && !showProgress ? "上次执行记录：" + reported : showProgress || reported));
+    if (showProgress && (job.error || job.result?.action_required)) card.append(node("p","", (continuation ? "上次执行记录：" : "") + displayMessage));
+    if (continuation) {
+      const phase = ACTIVE.has(continuation.status) ? "进行中" : continuation.result?.task_complete ? "已返回交付回执" :
+        continuation.result?.action_required ? "等待处理" : "已停止";
+      card.append(node("p","","同一委托的最新续做：" + phase + (continuation.message ? " · " + continuation.message : "")));
+      if (execution?.commission_id === job.message_id && execution.last_execution?.id === continuation.id && usage && limits) {
+        const counts = [];
+        if (Number.isInteger(usage.reserved_video_generations) && Number.isInteger(limits.max_video_generations))
+          counts.push("已预留视频生成 " + usage.reserved_video_generations + " / " + limits.max_video_generations + " 次");
+        if (Number.isInteger(usage.model_calls) && Number.isInteger(limits.max_model_calls))
+          counts.push("模型调用 " + usage.model_calls + " / " + limits.max_model_calls + " 次");
+        if (counts.length) card.append(node("p","small-print",counts.join(" · ")));
+      }
+      card.append(button("查看续做进度与视频 Agent 记录", () => {
+        if (state.projectId === jobProjectId(job) && !state.storyDraftId && !state.creating) return setStep("agent");
+      }, {quiet:true,small:true,className:"job-result-button"}));
+    }
+    if (isFeedbackJob(job)) {
+      const feedback=node("p","small-print",Object.hasOwn(feedbackJobs,job.id) ?
+        feedbackText(feedbackJobs[job.id],job) : review ? reviewProgress(review) : "正在读取自动旁路状态…");
+      feedback.dataset.feedbackJob=job.id;
+      card.append(feedback);
+      const link = feedbackJobs[job.id]?.review_link;
+      if (!review && link?.kind === "inspect_commission_reports" && link.job_id === job.id && link.project_id === projectId &&
+          link.commission_id === job.message_id) {
+        card.append(button("查看镜头与阻塞原因", () => {
+          if (feedbackJobs[job.id]?.review_link?.id === link.id)
+            return openFeedbackDestination({pid:projectId,prompt:link});
+        }, {quiet:true,small:true}));
+      }
+    }
     if (pastAssetReview) card.append(node("small","small-print","当前选用状态见「共享资产」。"));
     if (assetIssues) {
       const list = node("ul","asset-job-problems");
@@ -634,7 +1046,7 @@ function renderCreate() {
   style.addEventListener("input",()=>{state.assetStyle=style.value;});
   form.append(formField("script-asset-style","全剧风格、配色与创作意图（可选）",style));
   form.append(node("p", "small-print", "分镜编译的每个阶段最多修复 2 次，模型调用结果不确定时保留 Trace。剧本和分镜就绪后，Agent 自动制作图片和声音，按剧本与风格自检，通过后将该版本用于相关镜头。在共享资产中可填写修改要求并重新生成。生成与核验会调用各用途配置的模型。"));
-  if (!keyReady("script.decision")) form.append(note("左侧的《最后一把钥匙》可以直接查看。要生成新剧本，请配置剧本对话模型所用的 API Key，然后重启工作台。默认百炼配置支持双击启动文件填写密钥。", true));
+  if (!keyReady("script.decision")) form.append(note("左侧的《最后一把钥匙》可以直接查看。要生成新剧本，请在 .env 填写剧本对话模型所用连接的 API Key，然后重启工作台。", true));
   const busy = state.pending.has("create") || state.jobs.some((job) => ACTIVE.has(job.status) && /story|create|build|script/.test(job.kind));
   const submit = button(busy ? "剧本制作中…" : "创作剧本并制作资产  →", () => {}, { primary: true, disabled: busy || !keyReady("script.decision") }); submit.type = "submit";
   const footer = node("div", "form-bottom"); append(footer, billing("调用已配置的模型，可能计费。创意与制作结果保存在本机。"), submit); form.append(footer);
@@ -1548,6 +1960,21 @@ function renderProjectOpening({ summary, error }) {
   return panel;
 }
 
+function restoreVideoPlayback(video, previousVideos) {
+  const src=video.getAttribute("src");
+  if (!src) return;
+  const previous=previousVideos.find(entry=>entry.src===src && entry.takeId===video.dataset.takeId);
+  if (!previous) return;
+  if (previous.element!==video && Number.isFinite(previous.time) && previous.time>0) {
+    const seek=()=>{ video.currentTime=previous.time; };
+    if (video.readyState>=1) seek();
+    else video.addEventListener("loadedmetadata",seek,{once:true});
+  }
+  // A paused take with preload="none" stays idle. A playing take must start
+  // the request itself before its loadedmetadata handler can restore the time.
+  if (!previous.paused && video.paused) video.play().catch(()=>{});
+}
+
 function renderStage({ preserveAgentEditing = false } = {}) {
   // Polling must not detach a composing textarea or an open native select.
   // Manual navigation still renders immediately; the activity rail refreshes independently.
@@ -1580,7 +2007,8 @@ function renderStage({ preserveAgentEditing = false } = {}) {
   const activeId = document.activeElement?.id;
   const cursor = document.activeElement?.selectionStart;
   const openDetails = [...stage.querySelectorAll("details")].map((element) => element.open);
-  const videos = [...stage.querySelectorAll("video")].map((video) => ({ src: video.getAttribute("src"), time: video.currentTime, paused: video.paused }));
+  const videos = [...stage.querySelectorAll("video")].map(video=>({element:video,src:video.getAttribute("src"),
+    takeId:video.dataset.takeId,time:video.currentTime,paused:video.paused}));
   stage.replaceChildren();
   if (state.loading) { const loading = node("div", "loading-state"); append(loading, node("span", "spinner"), node("p", "", "正在打开工程")); stage.append(loading); return; }
   if (state.step === "traces") stage.append(renderTraces());
@@ -1605,10 +2033,7 @@ function renderStage({ preserveAgentEditing = false } = {}) {
   }
   if (state.step !== "studio") [...stage.querySelectorAll("details")].forEach((element, index) => { if (openDetails[index] !== undefined) element.open = openDetails[index]; });
   if (activeId && $(activeId)) { const focus = $(activeId); focus.focus({ preventScroll: true }); if (typeof cursor === "number" && focus.setSelectionRange) focus.setSelectionRange(cursor, cursor); }
-  stage.querySelectorAll("video").forEach((video) => {
-    const previous = videos.find((entry) => entry.src === video.getAttribute("src"));
-    if (previous) video.addEventListener("loadedmetadata", () => { if (Number.isFinite(previous.time)) video.currentTime = previous.time; if (!previous.paused) video.play().catch(() => {}); }, { once: true });
-  });
+  stage.querySelectorAll("video").forEach(video=>restoreVideoPlayback(video,videos));
   markStartupReady();
 }
 async function openProducedStory(id) {
@@ -1738,6 +2163,7 @@ function markStartupReady(){
   startupMetric("Ready");
 }
 async function poll() {
+  void refreshFeedbackJobs();
   if (!state.config && state.loading) return;
   if (state.projectOpening && state.loading) {
     if (currentPhase() === "video") void studioLocal(state.projectId).monitor?.refresh();

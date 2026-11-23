@@ -6,6 +6,8 @@
 
 **每项用途独立选模。** 剧本对话读取 `routes["script.decision"]`，视频制作对话读取 `routes["video.decision"]`，参考图生成读取 `routes["reference.image"]`，普通视频和带参考的视频各有自己的路由。多个用途可以共用模型，也可以分别使用不同供应商。拍摄委托确认时固定实际路由，已经提交的镜头按原供应商和原账户恢复。
 
+**Windows 系统代理。** SDK 传输读取 Windows「设置 → 网络和 Internet → 代理」中已启用的手动代理，按请求协议及系统代理例外列表选择连接方式。API 和供应商返回的视频下载地址分别判断；关闭系统代理后，新请求恢复直连。代理选择以不含凭据的记录写入 Trace，仍使用验证服务器证书的 TLS 连接。连接失败不会自动直连兜底或重发付费请求。此接入不执行 PAC/WPAD 自动配置脚本，环境变量代理不覆盖此设置；非 Windows 平台保持原有 SDK 直连行为。
+
 ## 片场、Pi 和 SDK 各自负责什么
 
 | 工作内容 | 片场与 Pi 负责 | LiteLLM SDK 负责 |
@@ -103,9 +105,12 @@ ARK_VIDEO_API_KEY=...
 | --- | --- | --- |
 | `script.decision`、`video.decision` | 两个 Pi Agent 分别对话、调用工具和压缩会话 | 百炼原生或 SDK 的 `openai` 兼容聊天 |
 | `story.compile`、`reference.prompt`、`voice.casting`、`video.repair_strategy` | 分镜编译、参考图提示、选声与重拍策略 | 百炼原生或 SDK 的 `openai` 兼容聊天 |
-| `reference.image` | 人物、道具、场景等资产的参考图 | 百炼原生或 SDK 的 `openai` 图像生成 |
+| `reference.image` | 人物、道具、场景等资产的参考图 | 百炼原生或 SDK 的 `openai` Images 协议。方舟 Seedream 使用方舟连接、模型 ID 和型号支持的 `image_size`。 |
 | `video.text_to_video`、`video.reference_to_video` | 普通镜头与带固定参考的镜头 | 百炼原生或 SDK 的 `volcengine` 视频 |
-| `voice.synthesis`、`voice.review`、`vision.review`、`continuity.review` | 语音合成、声音审查、视觉审查、相邻镜头声画验收 | 已有百炼原生适配器 |
+| `voice.synthesis` | 生成角色试音 | 百炼原生，或 SDK 的 OpenAI Chat Completions 音频输出（WAV） |
+| `voice.review`、`vision.review`、`continuity.review` | 声音审查、画面审查、相邻镜头声画验收 | 百炼原生，或 `adapter: "openai"`。OpenAI 衔接验收同时使用 `continuity.review` 听音轨、`vision.review` 看带时序的帧。 |
+
+仓库当前的 [models.json](../config/models.json) 有 10 项用途使用 OpenAI。方舟同一连接负责另外 3 项用途：Seedream 生成参考图，Seedance 处理文生视频与参考生视频。`disabled_providers` 禁用 `aliyun-bailian` 后，缺少覆盖的用途会在加载时指出。原来由百炼受理、结果未知的视频任务保留原任务 ID；供应商禁用期间无法在线查询，片场不会把它当成新任务转发。
 
 替换以上已接协议的型号时，更新模型别名或用途即可。新增 SDK 协议时，先在 [SDK 调用边界](../pianchang/sdk_transport.py) 验证实际请求、输入输出、单次发送和恢复，再在配置加载器中为对应用途开放。配置文件只保存密钥变量名；同名系统环境变量优先于项目 `.env`。调整配置后重新启动工作台，让新会话读取同一份配置。在账户轮换密钥时保留原连接名、账户和端点，以便继续查询旧任务。
 

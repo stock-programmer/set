@@ -14,12 +14,19 @@ from trace_system import event, traced
 from .requirements import explicit_quantities,check_quantities
 
 EMPTY={"type":"object","properties":{}}
+SPEC_PATCH = {"type":"object","properties":{
+    "changes":{"type":"array","minItems":1,"maxItems":80,"items":{"type":"object",
+        "properties":{"path":{"type":"array","minItems":1,"maxItems":20,"items":{}},
+                      "value":{}}, "required":["path","value"]}},
+    "changes_json":{"type":"string","minLength":2,"maxLength":12000},
+}}
 
 
 class StoryTools:
     def __init__(self, service, session, job, text, *, collaborator=None):
         self.service,self.session,self.job=service,session,job
         self.text=re.sub(r"^\[message_id=[a-f0-9]{32}\]\n","",text)
+        self.retry_patch_step = None
         self.source_id=session["source_job"]
         run_id=self.source_id or session["story_id"].removeprefix("story-")
         self.collab=Collaboration(service.root/"outputs/collaborations", run_id,env_file=service.root/".env")
@@ -78,8 +85,8 @@ class StoryTools:
         self.tools=self.workspace.tools()+[
             Tool("read_story_context","读取实际冻结剧本、恢复证据、分镜格式和当前约束。",EMPTY,self.read_context),
             Tool("read_production_spec","读取已保存的分镜候选及其真实校验问题。",EMPTY,self.read_spec),
-            Tool("patch_production_spec","定向修复分镜候选。changes_json为JSON数组，每项{path:[字段或数组索引],value:新值}。只改制作规格，不改冻结剧本，不伪造参考。",
-                 {"type":"object","properties":{"changes_json":{"type":"string","minLength":2,"maxLength":12000}},"required":["changes_json"]},self.patch_spec,effect="write"),
+            Tool("patch_production_spec","用原生 changes 数组分批写分镜。每项含 path（字段或数组索引）和 value。每次写一个字段或一个镜头，读取返回的校验再继续；首次创建 shots 数组，之后用当前长度作索引追加。changes_json 仅供旧会话兼容。保留冻结剧本和真实参考。",
+                 SPEC_PATCH,self.patch_spec,effect="write"),
             Tool("check_production_spec","按原条件核验分镜、来源、节拍覆盖、状态与真实参考；保留全部未通过项。",EMPTY,self.check_spec),
             Tool("publish_production_spec","结构与剧情来源通过后发布制作工程；缺少参考时保持不可生成，并交给现有资产制作任务。",EMPTY,self.publish_spec,effect="write"),
             Tool("begin_script_revision","用户要求修改剧本时开始新版本；保留原版并使旧分镜候选失效。",
@@ -116,13 +123,24 @@ class StoryTools:
                 "script_ref":self.script_ref,"existing_publication":self.existing_publication,"interruption_evidence":self.unknown}
 
     @traced("pi.story.patch_spec",kind="tool",capture_inputs=False)
-    def patch_spec(self, changes_json):
-        changes=json.loads(changes_json)
+    def patch_spec(self, changes_json=None, *, changes=None):
+        if (changes is None) == (changes_json is None):
+            raise ValueError("须提供 changes 数组或旧格式 changes_json 中的一项")
+        if changes_json is not None:
+            try:
+                changes=json.loads(changes_json)
+            except json.JSONDecodeError as exc:
+                self.retry_patch_step = 0
+                raise ValueError(f"changes_json 在字符 {exc.pos} 处无效，本次未写入。改用 changes 数组，只重提一个字段或镜头并检查返回结果。") from exc
+        elif len(json.dumps(changes,ensure_ascii=False,separators=(",",":"))) > 12000:
+            raise ValueError("本批修改过长，请拆成单个字段或镜头提交。")
         if not isinstance(changes,list) or not 1<=len(changes)<=80:raise ValueError("修改须为1～80项数组")
         candidate=copy.deepcopy(self.spec or {})
         for change in changes:
             path=change.get("path")
-            if not isinstance(path,list) or not path or path[0]=="script_source" or len(path)>20:
+            if (not isinstance(path,list) or not path or not isinstance(path[0],str)
+                    or path[0]=="script_source" or len(path)>20
+                    or any(type(field) not in (str,int) for field in path)):
                 raise ValueError("修改路径无效或试图修改冻结来源")
             target=candidate
             for field in path[:-1]:target=target[field]
@@ -138,7 +156,19 @@ class StoryTools:
         write_json(self.spec_path,candidate)
         self.spec=candidate
         self.result=None
+        if any(change["path"][0] in {"entities","facts","events","shots"} for change in changes):
+            self.retry_patch_step = None
         return self.check_spec()
+
+    def stop_check(self, record):
+        if self.retry_patch_step is None:
+            return {"allowed":True}
+        # Give a recoverable argument error one follow-up decision within the existing budget.
+        step = record["steps"]
+        if self.retry_patch_step == 0:
+            self.retry_patch_step = step
+        return {"allowed":step > self.retry_patch_step,
+                "next_action":"用 changes 数组补写一个缺失字段或镜头，然后按校验结果继续。"}
 
     @traced("pi.story.check_spec",kind="validation",capture_inputs=False)
     def check_spec(self):
@@ -148,6 +178,14 @@ class StoryTools:
         report=validate_compilation(candidate,self.script)
         requested=check_quantities(self.detail["idea"],self.script,candidate)
         extra=[{"code":"REQUESTED_QUANTITY","path":r["path"],"message":"原创意明确数量未满足",**r} for r in requested if r["status"]=="FAIL"]
+        from pi_bridge.requirements import seedance_request_limit
+        from pianchang.generation_groups import group_generation_tasks
+        limit = seedance_request_limit(self.detail["idea"])
+        if limit is not None and not any(i.get("severity","error")=="error" and i["code"]!="MISSING_REFERENCE" for i in report["issues"]):
+            try:
+                report = validate_compilation(group_generation_tasks(candidate, limit), self.script)
+            except ValueError as exc:
+                extra.append({"code":"GENERATION_GROUPS","path":"shots","message":str(exc)})
         report={**report,"issues":report["issues"]+extra,"requested_quantity_checks":requested,
                 "ready_for_generation":report["ready_for_generation"] and not extra}
         # Distinct pipeline stage, not a downgrade: original ready_for_generation stays false.
@@ -164,6 +202,11 @@ class StoryTools:
         report=self.check_spec()
         if not report.get("structure_ready"):return {"published":False,"validation":report}
         project=copy.deepcopy(self.spec);project["script_source"]={"sha256":digest_json(self.script),"script":self.script}
+        from pi_bridge.requirements import seedance_request_limit
+        from pianchang.generation_groups import group_generation_tasks
+        limit = seedance_request_limit(self.detail["idea"])
+        if limit is not None:
+            project = group_generation_tasks(project, limit)
         if self.existing_publication and digest_json(project)==self.existing_publication["source_ref"]["sha256"]:
             self.result=self.existing_publication
             return {**self.result,"reused":True,"summary":"沿用已发布的同一制作工程；没有重复提交资产或视频生成。"}

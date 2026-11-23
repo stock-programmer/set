@@ -1,0 +1,65 @@
+{
+    "version": 1,
+    "extends": "bailian",
+    "disabled_providers": ["aliyun-bailian"],
+    "connections": {
+        "openai-production": {
+            "provider": "openai",
+            "account": "studio-openai",
+            "base_url": "https://api.openai.com/v1",
+            "api_key_env": "OPENAI_API_KEY"
+        },
+        "ark-production": {
+            "provider": "volcengine-ark",
+            "account": "studio-ark",
+            "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+            "api_key_env": "ARK_VIDEO_API_KEY"
+        }
+    },
+    "models": {
+        "openai-writer": {
+            "connection": "openai-production", "adapter": "litellm", "sdk_provider": "openai",
+            "model_id": "gpt-5.4"
+        },
+        "openai-image": {
+            "connection": "openai-production", "adapter": "litellm", "sdk_provider": "openai",
+            "model_id": "gpt-image-2.5-flare"
+        },
+        "seedream-5-0": {
+            "connection": "ark-production", "adapter": "litellm", "sdk_provider": "openai",
+            "model_id": "doubao-seedream-5-0-pro-260628", "image_size": "2048x2048",
+            "image_response_format": "b64_json"
+        },
+        "openai-vision": {
+            "connection": "openai-production", "adapter": "openai", "model_id": "gpt-5.4-mini"
+        },
+        "openai-voice": {
+            "connection": "openai-production", "adapter": "litellm", "sdk_provider": "openai",
+            "model_id": "gpt-audio-1.5"
+        },
+        "openai-listener": {
+            "connection": "openai-production", "adapter": "openai", "model_id": "gpt-audio-1.5"
+        },
+        "seedance-mini": {
+            "connection": "ark-production",
+            "adapter": "litellm",
+            "sdk_provider": "volcengine",
+            "model_id": "doubao-seedance-2-0-mini-260615"
+        }
+    },
+    "routes": {
+        "script.decision": "openai-writer",
+        "video.decision": "openai-writer",
+        "story.compile": "openai-writer",
+        "reference.prompt": "openai-writer",
+        "voice.casting": "openai-writer",
+        "video.repair_strategy": "openai-writer",
+        "reference.image": "seedream-5-0",
+        "voice.synthesis": "openai-voice",
+        "voice.review": "openai-listener",
+        "vision.review": "openai-vision",
+        "continuity.review": "openai-listener",
+        "video.text_to_video": "seedance-mini",
+        "video.reference_to_video": "seedance-mini"
+    }
+}

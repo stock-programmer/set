@@ -3,6 +3,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from collections import Counter
 from contextlib import closing
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -144,7 +145,8 @@ def _manifest(path, stamp):
             "shot_id": metadata.get("shot_id"), "dependency": metadata.get("dependency_sha256"),
             "media": data.get("local_video_path"), "media_sha256": data.get("download_sha256"), "recovery": bool(data.get("recovery_source")),
             "repair_id": (metadata.get("acceptance_repair") or {}).get("repair_id"), "execution_key": metadata.get("execution_key"),
-            "updated_at": data.get("updated_at"), "provider_status": (data.get("provider_response") or {}).get("output", {}).get("task_status")}
+            "updated_at": data.get("updated_at"), "provider_status": (data.get("provider_response") or {}).get("output", {}).get("task_status"),
+            "provider_task_id": (data.get("provider_response") or {}).get("output", {}).get("task_id")}
 
 
 def _candidate(path, video_root):
@@ -310,6 +312,45 @@ def _open_candidates(video_root, needed, plan, script, created_at, *, work=None)
     return matches
 
 
+def confirmed_video_reservations(output, work, plan, script, checkpoint, *, created_at=None, paid_clips=None):
+    """Match each billed reservation to one successful receipt from this frozen order."""
+    base = checkpoint["reserved_shots"]
+    repairs = checkpoint["repair_reservations"]
+    scheduled = set(plan["new_shots"] + plan["retake_shots"])
+    policy = plan.get("acceptance_loop") or {}
+    if (not isinstance(base, list) or not isinstance(repairs, dict)
+            or len(base) != len(set(base)) or not set(base) <= scheduled
+            or any(sid not in policy.get("shot_ids", []) or type(n) is not int
+                   or not 0 < n <= policy["max_repairs_per_shot"] for sid, n in repairs.items())):
+        return False
+    expected = Counter((sid, False) for sid in base)
+    expected.update({(sid, True): n for sid, n in repairs.items()})
+    if sum(expected.values()) != checkpoint.get("video_generations"):
+        return False
+    output = Path(output).resolve()
+    candidates = _open_candidates(output, scheduled | set(policy.get("shot_ids", [])), plan, script, created_at, work=work)
+    actual = Counter()
+    keys, tasks = set(), set()
+    for sid, manifests in candidates.items():
+        for item in manifests:
+            key, task = item.get("execution_key"), item.get("task_id")
+            response = (_read(item["file"]).get("provider_response") or {}).get("output") or {}
+            if (not key or key in keys or not task or task in tasks or response.get("task_id") != task
+                    or response.get("task_status") != "SUCCEEDED" or item.get("status") != "SUCCEEDED"):
+                return False
+            if paid_clips is not None:
+                clip = paid_clips.get(key) or {}
+                if (clip.get("task_id") != task or clip.get("shot_id") != sid or clip.get("script_ref") != script
+                        or clip.get("manifest_path") != str(item["file"]) or clip.get("generation_job_sha256") != item["hash"]
+                        or clip.get("media_path") != item["media"] or clip.get("media_sha256") != item["media_sha256"]
+                        or not _verified_file(item["media"], item["media_sha256"], item["file"].parent)):
+                    return False
+            keys.add(key)
+            tasks.add(task)
+            actual[(sid, bool(item.get("repair_id")))] += 1
+    return actual == expected and (paid_clips is None or keys == set(paid_clips))
+
+
 @traced("video.repair.observe_local_pre_submit_failure", kind="validation", capture_inputs=False, capture_output=False)
 def local_failure_before_generation(history, directory, *, saved_run=None):
     """Distinguish an observed local archive failure from an uncertain paid call."""
@@ -379,7 +420,64 @@ def _clip_acceptance(summary, row, project_sha256, job_sha256, outputs, selected
     return summary["status"] if valid else "UNKNOWN"
 
 
-def _snapshot(root, project_id, job, video_root, preview_url, *, include_reviews=True):
+def _version_report(summary, clip, project_sha, work):
+    if not summary or not summary.get("report_path"):
+        return {}
+    path = Path(summary["report_path"]).resolve()
+    if not path.is_relative_to(work.parent) or path.suffix != ".json" or not path.is_file():
+        return {}
+    report = _read(path)
+    if (not report or digest_json(report) != summary.get("report_sha256") or report.get("shot_id") != clip["shot_id"]
+            or report.get("media_sha256") != clip["media_sha256"] or report.get("project_sha256") != project_sha):
+        return {}
+    issues = [{k:r.get(k) for k in ("criterion_id","required","status","reason")}
+              for r in report.get("results",[]) if r.get("required") and r.get("status") != "PASS"]
+    return {"report_sha256":summary["report_sha256"], "report":{"status":report["status"],"results":issues}}
+
+
+def _shot_versions(row, selected, selected_path, reports, history, source, order, video_root, work,
+                   project_sha, preview_url, paths):
+    sid = row["shot_id"]
+    versions = {}
+    def add(clip, path, summary, *, rejected=False, current=False):
+        key = (clip["task_id"], clip["media_sha256"])
+        kind = {"reused":"reuse", "edited":"edit"}.get(clip.get("operation"),
+                     "retake" if clip.get("repair_id") else "initial")
+        version = {"shot_id":sid, "task_id":key[0], "media_sha256":key[1], "kind":kind, "selected":current}
+        if preview_url:
+            version["preview_url"] = preview_url(sid, key[1])
+            version.update(_version_report(summary, clip, project_sha, work))
+        if rejected and not current:
+            version["selection_reason"] = "rejected_regression"
+        versions[key] = version
+        paths[(sid,key[1])] = path
+
+    for repair in history:
+        if repair.get("shot_id") != sid:
+            continue
+        for name in ("source","result"):
+            clip = repair.get(name+"_clip")
+            if not isinstance(clip,dict) or not clip.get("manifest_path"):
+                continue
+            if name == "result" and (not repair.get("repair_id") or clip.get("repair_id") != repair["repair_id"]):
+                continue
+            path = _verified_clip(clip,sid,source,order,order["shooting_plan"],video_root,work)
+            if not path:
+                continue
+            manifest = _candidate(Path(clip["manifest_path"]),video_root)
+            if (manifest.get("provider_status") != "SUCCEEDED" or manifest.get("provider_task_id") != clip["task_id"]
+                    or clip.get("operation") == "generated" and manifest.get("repair_id") != clip.get("repair_id")):
+                continue
+            add(clip,path,repair.get(name+"_report"),
+                rejected=name=="result" and repair.get("status")=="reviewed_rejected_regression")
+    if selected_path and row.get("task_id"):
+        # Older interrupted downloads may have only an independently observed file.
+        clip = selected or {k:row[k] for k in ("shot_id","task_id","media_sha256")}
+        add(clip,selected_path,reports.get(sid),current=True)
+    return list(versions.values())
+
+
+def _snapshot(root, project_id, job, video_root, preview_url, *, include_reviews=True, version_paths=None):
     root = Path(root).resolve()
     video_root = Path(video_root or root / "outputs/videos").resolve()
     if not isinstance(job, dict) or job.get("project_id") != project_id or job.get("kind") != "studio_video" or not _ID.fullmatch(str(job.get("id"))):
@@ -416,8 +514,8 @@ def _snapshot(root, project_id, job, video_root, preview_url, *, include_reviews
     run = _read(work / "agent/run.json")
     reserved = set(run.get("reserved_shots") or [])
     matched = _open_candidates(video_root, reserved-set(clips), plan, order["script"], job.get("created_at"), work=work)
-    reports = _read(work / "reports.json") if include_reviews else {}
-    project_sha256 = digest_json(project) if reports and project else None
+    reports = _read(work / "reports.json") if include_reviews or version_paths is not None and preview_url else {}
+    project_sha256 = digest_json(project) if project and (reports or version_paths is not None and preview_url) else None
     job_hashes = {}
     active = status in _ACTIVE and delivery_status not in {"unknown","blocked","failed","completed"} and run.get("status") not in {
         "needs_input","budget_exhausted","cancelled","error","completed"}
@@ -486,12 +584,19 @@ def _snapshot(root, project_id, job, video_root, preview_url, *, include_reviews
         if pending:
             row["repair_pending"] = True
             row["reason"] = "修复执行结果尚未全部确认，原候选保留，不会自动重复提交。"
-    if reports:
+        if version_paths is not None:
+            row["versions"] = _shot_versions(row,clip,files.get(sid),reports,history,source,order,video_root,work,
+                                            project_sha256,preview_url,version_paths)
+    if include_reviews and reports:
+        from pianchang.shot_approval import read_approvals
+        approvals = read_approvals(work, project, clips, reports, project_id=project_id)
         selected = {r["shot_id"]: r["media_sha256"] for r in data["shots"] if r["shot_id"] in files}
         for row in data["shots"]:
             sid = row["shot_id"]
             if sid in files:
                 row["acceptance_status"] = _clip_acceptance(reports.get(sid), row, project_sha256, job_hashes[sid], root / "outputs", selected)
+                if sid in approvals and approvals[sid]["media_sha256"] == row["media_sha256"]:
+                    row["human_approved"] = True
     later_clips = [r["shot_id"] for r in data["shots"] if r.get("independently_observed") and r["shot_id"] in files]
     if phase == "stopped" and later_clips:
         data["original_reason"] = data["reason"]
@@ -506,11 +611,13 @@ def read_production_progress(root, project_id, job, *, video_root=None, preview_
 
 @traced("studio.video.live_clip", kind="validation", capture_inputs=False, capture_output=False)
 def resolve_production_clip(root, project_id, job, shot_id, media_sha256, *, video_root=None,state_dir=None):
-    data, files = _snapshot(root, project_id, job, video_root, None, include_reviews=False)
-    actual = next((r.get("media_sha256") for r in data["shots"] if r["shot_id"] == shot_id), None)
-    valid = shot_id in files and actual == media_sha256
+    versions = {}
+    data, _ = _snapshot(root, project_id, job, video_root, None, include_reviews=False, version_paths=versions)
+    path = versions.get((shot_id,media_sha256))
+    actual = media_sha256 if path else next((r.get("media_sha256") for r in data["shots"] if r["shot_id"] == shot_id), None)
+    valid = path is not None
     event("studio.video.live_clip_checked", {"project_id":project_id,"job_id":job["id"],"path":shot_id,
           "expected":media_sha256,"actual":actual,"status":"PASS" if valid else "FAIL"}, kind="validation")
     if not valid:
         raise KeyError("此镜头版本尚无可预览的文件。")
-    return files[shot_id]
+    return path

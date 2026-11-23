@@ -34,6 +34,24 @@ def _work(view, request_id):
     return Path(view["store_path"]).parent / "runs" / view["run_id"] / ("video-spec-" + request_id)
 
 
+def _used_retakes(root, run_id, request_id, pointer, order):
+    """Count reservations on this frozen input even for pre-limit continuation checkpoints."""
+    retried, seen = set(), set()
+    while True:
+        if request_id in seen or not re.fullmatch(r"[a-f0-9]{32}", request_id):
+            raise ValueError("恢复记录的委托标识无效或重复。")
+        seen.add(request_id)
+        prior_work = Path(root) / "outputs/collaborations/runs" / run_id / ("video-spec-" + request_id)
+        run = _read(prior_work / "agent/run.json", {})
+        retried.update(sid for sid, count in run.get("repair_reservations", {}).items() if count > 0)
+        retried.update(h["shot_id"] for h in _read(prior_work / "repair-history.json", {}).get("history", ())
+                       if h.get("strategy") == "prompt_and_locked_references" and h.get("status") != "local_failure_before_post")
+        if not pointer:
+            return sorted(retried)
+        checkpoint = _continuation_checkpoint(root, run_id, pointer, order)
+        request_id, pointer = pointer["request_id"], checkpoint["source"].get("prior_continuation")
+
+
 @traced("studio.continuation.read", kind="validation", capture_inputs=False, capture_output=False)
 def read_incomplete_production(view):
     from pianchang.studio_retakes import _latest_request
@@ -47,7 +65,8 @@ def read_incomplete_production(view):
         return None
     root = _root(view)
     state = _read(root / "outputs/web/state.json", {})
-    job = next((j for j in reversed(state.get("jobs", [])) if j.get("message_id") == request["id"]
+    job = next((j for j in reversed(state.get("jobs", [])) if j.get("kind") == "studio_video"
+                and j.get("run_id") == view["run_id"] and j.get("message_id") == request["id"]
                 and j.get("project_id") == view["project_id"]), None)
     if not job:
         return None
@@ -106,6 +125,14 @@ def read_incomplete_production(view):
     source = {"request_id": request["id"], "job_id": job["id"], "project_id": view["project_id"],
               "script_ref": view["script_ref"], "spec_ref": view["spec"], "project_sha256": project_sha256,
               "available": available, "missing_shots": missing, "unknown_shots": unknown, "failed_shots": failed}
+    # A new commission for the same frozen footage must not reset earlier retake reservations.
+    retried = _used_retakes(root, view["run_id"], request["id"], plan.get("continuation"), request["body"])
+    if retried:
+        source["previously_retried_shots"] = retried
+    from pianchang.video_autonomy import stopped_retake_summary
+    terminal = stopped_retake_summary(work, _read(work / "agent/run.json", {}))
+    if terminal:
+        source["retake_stop"] = terminal
     if plan.get("continuation"):
         source["prior_continuation"] = plan["continuation"]
     return {**source, "sha256": digest_json(source), "active": job["status"] in {"queued", "running"}}
@@ -173,6 +200,9 @@ def load_continuation(root, run_id, pointer, order):
     checkpoint = _continuation_checkpoint(root, run_id, pointer, order)
     for clip in checkpoint["shots"].values():
         _validated_media(clip, require_origin=True)
+    inherited = _used_retakes(root, run_id, pointer["request_id"], checkpoint["source"].get("prior_continuation"), order)
+    if inherited:
+        checkpoint["previously_retried_shots"] = inherited
     return checkpoint
 
 
@@ -199,6 +229,18 @@ def run_review_job(service, job, body):
     from pianchang.studio_assets import studio_project_for_video
     from pianchang.video_collab_agent import VideoWorkspace, analyze_impact
     view = studio_project_for_video(service, job["project_id"])
+    retry = None
+    if "retry_observation" in body:
+        if job.get("cancel_requested") or job.get("trace_incomplete"):
+            raise ValueError("验收复查已中断，保留原观察回执。")
+        from pianchang.review_recovery import owner_for, review_retry
+        with service.lock:
+            owner = owner_for(service.state["jobs"],job["project_id"],excluding=job["id"])
+        retry = review_retry(service,view,read_incomplete_production(view),owner,excluding=job["id"])
+        if not retry or retry["token"] != body["retry_observation"] or retry["key"] != job.get("_idempotency_key"):
+            raise ValueError("验收任务、当前报告或未发送回执已更新，已停止本次复查。")
+        if (retry.get("internal_cuts") or retry.get("sequence_assembly")) and job.get("review_request_id") != body["continuation"]["request_id"]:
+            raise ValueError("切点复验与原制作委托不匹配。")
     checkpoint = prepare_continuation(view, body["continuation"])
     work = _work(view, body["continuation"]["request_id"])
     workspace = VideoWorkspace(script=view["project"]["script_source"]["script"], script_ref=view["script_ref"],
@@ -209,6 +251,63 @@ def run_review_job(service, job, body):
     workspace.impact = analyze_impact(view["project"], None)
     workspace.shots = checkpoint["shots"]
     workspace.defer_content_review = True
+    def reserve_content_review(purpose):
+        from pianchang.reference_inputs import reserve_external_review
+        with service.lock:
+            if job.get("cancel_requested") or job.get("trace_incomplete"):
+                raise ValueError("验收任务已停止，本次观察未发送。")
+            if retry and retry.get("sequence_assembly"):
+                raise ValueError("已有切点观察的本地合成不占用模型额度。")
+            if retry and (retry.get("legacy_audio") or retry.get("internal_cuts")):
+                from pianchang.review_recovery import review_work_in_flight
+                others = [j for j in service.state["jobs"] if j["id"] != job["id"]]
+                if review_work_in_flight(others,job["project_id"],body["continuation"]["request_id"]):
+                    raise ValueError("原委托有其他制作或验收操作，等待其结果。")
+            order = workspace.reference_store.get_message(body["continuation"]["request_id"])["payload"]
+            plan = order.get("shooting_plan") or {}
+            limit = (plan.get("execution_limits") or order.get("execution_limits") or {}).get("max_model_calls")
+            recorded_limit = (_read(work / "agent/run.json", {}).get("limits") or {}).get("max_steps")
+            if retry and retry.get("internal_cuts") and (type(limit) is not int or type(recorded_limit) is not int or limit != recorded_limit):
+                raise ValueError("段内切点复验的模型额度与原委托不匹配。")
+            limits = [n for n in (limit, recorded_limit) if type(n) is int]
+            reserve_external_review(work / "reference-inputs", min(limits) if limits else None, purpose=purpose)
+
+    reserve_content_review.commission_id = body["continuation"]["request_id"]
+    workspace.reserve_content_review = reserve_content_review
+    if retry:
+        from pianchang.content_review import run_content_reviews
+        from pianchang.review_dispatch import retry_review_scope
+        workspace.reports = _read(work/"reports.json")
+        if retry.get("legacy_audio"):
+            from pianchang.legacy_sound_review import apply_legacy_sound
+            completed = apply_legacy_sound(workspace,retry)
+        elif retry.get("internal_cuts"):
+            from pianchang.internal_review_recovery import apply_internal_cuts
+            completed = apply_internal_cuts(workspace,retry)
+        elif retry.get("sequence_assembly"):
+            from pianchang.sequence_review_recovery import apply_sequence_assembly
+            with retry_review_scope({}):
+                completed = apply_sequence_assembly(workspace,retry)
+        else:
+            with retry_review_scope(retry["allowed"]):
+                run_content_reviews(workspace,publish_shots=sorted(retry["criteria"]))
+            completed = sum((_read(path,{}) or {}).get("status") == "completed" for path in retry["allowed"])
+        pending, failed = {}, {}
+        passed = 0
+        for sid, criteria in retry["criteria"].items():
+            report = _read(workspace.reports[sid]["report_path"])
+            verdicts = {r["criterion_id"]:r["status"] for r in report["results"] if r["required"]}
+            passed += sum(verdicts.get(cid) == "PASS" for cid in criteria)
+            rejected = [cid for cid in criteria if verdicts.get(cid) == "FAIL"]
+            if rejected:
+                failed[sid] = rejected
+            missing = [cid for cid in criteria if verdicts.get(cid) not in {"PASS","FAIL"}]
+            if missing:
+                pending[sid] = missing
+        return {"reports":workspace.reports,"review_retry":{"completed_observations":completed,
+                "failed_criteria":failed,"pending_criteria":pending},"action_required":bool(pending or failed),
+                "summary":f"已取得 {completed} 项观察回执。复查要求通过 {passed} 项，未通过 {sum(map(len,failed.values()))} 项，"
+                          f"待核对 {sum(map(len,pending.values()))} 项。"}
     errors = {}
     for sid in workspace.shots:
         service._update(job, message="正在自动验收 " + sid + "；已生成素材会逐个保存结论")
@@ -228,6 +327,67 @@ def run_review_job(service, job, body):
     return {"reports": workspace.reports, "summary": f"已检查 {len(workspace.reports)} 个已有镜头；未通过项保留在视频 Agent 的待修复清单。"}
 
 
+def _has_current_reuse_reviews(view, snapshot, plan):
+    """Check whether the production loop already reviewed the exact selected set."""
+    from pianchang.acceptance import create_contract, verify_inspection
+    from pianchang.content_review import CONTENT_KINDS, NORMALIZATION_VERSION, STATE_AUDIT_VERSION, VERSION, validate_content_evidence
+    from pianchang.creative_sound import legacy_audio_checks
+    from pianchang.video_autonomy import all_reused_continuation
+    from pianchang.video_collab_agent import _validated_media
+
+    project = view["project"]
+    order = [s["id"] for s in project["shots"]]
+    available = snapshot["available"]
+    if (not all_reused_continuation(plan) or set(order) != set(plan["reuse_shots"])
+            or set(order) != set(available) or any("clip" not in entry for entry in available.values())):
+        return False
+    edges = list(zip(order, order[1:]))
+    try:
+        media = {sid: entry["clip"]["media_sha256"] for sid, entry in available.items()}
+        records = _read(_work(view, snapshot["request_id"]) / "reports.json", {})
+        for sid in order:
+            clip, record = available[sid]["clip"], records[sid]
+            folder = Path(record["report_path"]).parent
+            report = _read(record["report_path"])
+            if legacy_audio_checks(next(s for s in project["shots"] if s["id"] == sid), report):
+                return False
+            contract, evidence = _read(folder / "contract.json"), _read(folder / "content.json")
+            inspection = _read(record["inspection_path"])
+            if (report["content_review_version"] != VERSION or report["state_audit_version"] != STATE_AUDIT_VERSION
+                    or digest_json(report) != record["report_sha256"] or report["shot_id"] != sid
+                    or contract["shot_id"] != sid or report["media_sha256"] != media[sid]
+                    or report["project_sha256"] != digest_json(project) or report["contract_sha256"] != digest_json(contract)
+                    or report["content_evidence_sha256"] != digest_json(evidence)
+                    or report["inspection_sha256"] != digest_json(inspection)
+                    or {s: a["sha256"] for s, a in evidence["selected_media"].items()} != media):
+                return False
+            job = _validated_media(clip, require_origin=True)
+            if any(report.get(key) not in (None, digest_json(job)) for key in ("generation_job_sha256", "reference_job_sha256")):
+                return False
+            verify_inspection(inspection)
+            content = validate_content_evidence(project, contract, inspection, evidence)
+            required = {r["criterion_id"]: r["kind"] for r in create_contract(project, sid)["requirements"] if r["required"]}
+            required.update({r["criterion_id"]: r["kind"] for r in contract["requirements"] if r["required"]})
+            required.update({f"continuity:{left}->{right}": "sequence_review" for left, right in edges if sid in (left, right)})
+            observed = {r["criterion_id"] for r in report["results"] if r["required"] and r["status"] in {"PASS", "FAIL", "UNKNOWN"}}
+            if (not required.keys() <= observed or not {cid for cid, kind in required.items() if kind in CONTENT_KINDS} <= content.keys()
+                    or not evidence["receipts"]):
+                return False
+            subtitle = content.get("script_subtitle") or {}
+            if (subtitle.get("status") == "UNKNOWN" and subtitle.get("execution_status") in {"execution_error", "evidence_invalid"}
+                    and not subtitle.get("frame_audit_version")):
+                return False
+            for item in evidence["receipts"]:
+                receipt = _read(item["path"])
+                if receipt.get("version") == VERSION and receipt.get("normalization_version") != NORMALIZATION_VERSION:
+                    return False
+    except TraceError:
+        raise
+    except (KeyError, ValueError, TypeError, OSError):
+        return False
+    return True
+
+
 @traced("studio.review.enqueue", kind="task", capture_inputs=False)
 def enqueue_incomplete_reviews(service):
     from pianchang.studio_assets import studio_project_for_video
@@ -241,12 +401,40 @@ def enqueue_incomplete_reviews(service):
             view = studio_project_for_video(service, pid)
             snapshot = read_incomplete_production(view)
             if snapshot and snapshot["available"] and not snapshot["active"]:
+                from pianchang.review_recovery import current_reports, owner_for, _receipts
+                with service.lock:
+                    owner = owner_for(service.state["jobs"],pid)
+                if not owner:
+                    continue
                 from pianchang.studio_retakes import _latest_request
                 request, _ = _latest_request(view)
-                if ((request or {}).get("body", {}).get("shooting_plan") or {}).get("repair_existing_only"):
+                plan = (request or {}).get("body", {}).get("shooting_plan") or {}
+                if snapshot.get("retake_stop"):
+                    from pianchang.legacy_sound_review import sidecar_commission
+                    from pianchang.review_recovery import review_retry, submit_review_scope
+                    if sidecar_commission(getattr(service,"root",None),pid,snapshot["request_id"],snapshot["job_id"]):
+                        scope = review_retry(service,view,snapshot,owner)
+                        with service.lock:
+                            existing = list(service.state["jobs"])
+                        new_job, _ = submit_review_scope(service,pid,snapshot,scope,existing)
+                        if new_job:
+                            jobs.append(new_job)
+                            event("studio.review.stopped_commission_recheck", {"project_id":pid,"request_id":snapshot["request_id"],
+                                  "review_job_id":new_job,"criteria":scope["criteria"]},kind="state")
+                            continue
+                if snapshot.get("retake_stop") or plan.get("repair_existing_only") or _has_current_reuse_reviews(view, snapshot, plan):
                     event("studio.review.repair_owned_reviews_retained", {"project_id":pid,
                           "request_id":snapshot["request_id"],"new_model_call":False,
-                          "reason":"修复任务的报告和未确认调用保留，由明确的继续修复任务接管，不在启动时重放。"}, kind="cache")
+                          "reason":"当前拍摄委托持有验收记录和恢复进度。"}, kind="cache")
+                    continue
+                # The review recovery watchdog separately owns any proved-unsent call in
+                # these current reports. A terminal or ambiguous review is retained.
+                from pianchang.video_autonomy import all_reused_continuation
+                directory = _work(view,snapshot["request_id"])
+                reports = current_reports(directory,snapshot)
+                if reports and (not all_reused_continuation(plan) or any(
+                        next(_receipts(refs,(directory/"cv2").resolve(),unresolved),None)
+                        for _,refs,unresolved in reports.values())):
                     continue
                 pointer = {"request_id": snapshot["request_id"], "sha256": snapshot["sha256"]}
                 from pianchang.content_review import VERSION
@@ -267,30 +455,37 @@ def enqueue_incomplete_reviews(service):
 
 @traced("studio.review.read", kind="tool", capture_inputs=False, capture_output=False)
 def incomplete_review_view(service, view, snapshot, *, jobs=None):
+    from pianchang.shot_approval import active_production, read_approvals, report_can_approve, selected_reviews, shot_preview_url
     if not snapshot:
         return None
     work = _work(view, snapshot["request_id"])
-    reports = _read(work / "reports.json", {})
-    prior_work = _work(view, snapshot["prior_continuation"]["request_id"]) if snapshot.get("prior_continuation") else None
-    prior_reports = _read(prior_work / "reports.json", {}) if prior_work else {}
+    reports = selected_reviews(view, snapshot)
+    clips = {sid: item.get("clip") or item["observation"] for sid, item in snapshot["available"].items()}
+    approvals = read_approvals(work, view["project"], clips, reports, project_id=view["project_id"])
+    if jobs is None:
+        jobs = service.list_jobs(detail_project=view["project_id"])
+    busy = snapshot.get("active") or view.get("pending_script_ref") or active_production(jobs, view["project_id"], snapshot["request_id"])
     confirmations = service.state.get("review_confirmations", {}).get(view["project_id"], {})
     shots = []
-    for sid, entry in snapshot["available"].items():
-        clip = entry.get("clip") or entry["observation"]
-        row = {"shot_id": sid, "preview_url": service.asset(clip["media_path"], expected_sha256=clip["media_sha256"],project_id=view["project_id"]),
-               "review_status": "pending", "human_confirmed": False}
-        summary = reports.get(sid) or prior_reports.get(sid)
+    for sid, clip in clips.items():
+        row = {"shot_id": sid, "request_id": snapshot["request_id"], "media_sha256": clip["media_sha256"],
+               "preview_url": shot_preview_url(view["project_id"], snapshot["job_id"], sid, clip["media_sha256"]),
+               "review_status": "pending", "human_confirmed": False, "human_approved": False, "can_approve": False}
+        summary = reports.get(sid)
         if summary:
             path = Path(summary["report_path"]).resolve()
-            _check(sid + ".report_location", True, path.is_relative_to(work.resolve())
-                   or bool(prior_work and path.is_relative_to(prior_work.resolve())))
+            _check(sid + ".report_location", True, path.is_relative_to(work.parent.resolve()))
             report = _read(path)
             _check(sid + ".report_hash", summary["report_sha256"], digest_json(report))
             _check(sid + ".report_media", clip["media_sha256"], report["media_sha256"])
+            _check(sid + ".report_project", digest_json(view["project"]), report["project_sha256"])
+            _check(sid + ".report_shot", sid, report["shot_id"])
             row.update(review_status="completed", status=report["status"], report=_display_report(service, summary, report,view["project_id"]),
                        content_review_version=report.get("content_review_version"),
                        report_sha256=summary["report_sha256"], report_url=service.asset(path),
                        unresolved=summary["unresolved"], trace_id=summary.get("trace_id"),
+                       human_approved=sid in approvals, can_approve=not busy and sid not in approvals
+                       and report_can_approve(report, _read(path.parent / "contract.json")),
                        human_confirmed=confirmations.get(sid, {}).get("report_sha256") == summary["report_sha256"])
         shots.append(row)
     repair_data = _read(work / "repair-history.json", {})
@@ -298,11 +493,10 @@ def incomplete_review_view(service, view, snapshot, *, jobs=None):
     repair_rows = [{"shot_id": h["shot_id"], "strategy": h["strategy"], "status": h["status"],
                     "repair_id": h["repair_id"], "source_status": (h.get("source_report") or {}).get("status"),
                     "result_status": (h.get("result_report") or {}).get("status"),
+                    "retake_failure": (h.get("retake_failure") or {}).get("summary"),
                     "trace_id": (h.get("trace_context") or {}).get("trace_id"),
                     "strategy_design":repair_data.get("plans",{}).get(h["repair_id"],{}).get("strategy_design")} for h in repairs]
-    if jobs is None:
-        jobs = service.list_jobs(detail_project=view["project_id"])
-    return {"request_id": snapshot["request_id"], "available_count": len(shots), "total": len(view["project"]["shots"]),
+    return {"request_id": snapshot["request_id"], "job_id": snapshot["job_id"], "available_count": len(shots), "total": len(view["project"]["shots"]),
             "autonomy": _read(work / "autonomy.json", {}),
             "repair_history": repair_rows,
             "reviewed_count": sum(s["review_status"] == "completed" for s in shots), "shots": shots,
@@ -361,7 +555,7 @@ def confirm_review(service, pid, body):
     _check("confirmation.report_sha256", (row or {}).get("report_sha256"), body["report_sha256"])
     if not row or row["review_status"] != "completed":
         raise ValueError("自动验收尚未完成。")
-    if data["available_count"] != data["total"] or any(s.get("status") != "PASS" for s in data["shots"]):
+    if data["available_count"] != data["total"] or any(s.get("status") != "PASS" and not s.get("human_approved") for s in data["shots"]):
         raise ValueError("视频 Agent 的必过验收尚未全部通过，当前仍属于自动修复阶段，不能进入人工预览确认。")
     if data.get("request_id") or not view.get("production_ref"):
         raise ValueError("视频 Agent 尚未完成已验收版本的交付，请等待人工预览解锁。")
@@ -376,9 +570,15 @@ def confirm_review(service, pid, body):
 
 @traced("studio.review.delivery_read", kind="tool", capture_inputs=False, capture_output=False)
 def delivery_review_view(service, view, package):
+    from pianchang.shot_approval import read_approvals
     if not package or package["content"]["project"] != view["project"]:
         return None
     data = package["content"]
+    approvals = {}
+    if data.get("manual_approvals"):
+        approvals = read_approvals(_work(view, data["request_id"]), view["project"],
+                                   data["shots"], data["reports"], project_id=view["project_id"])
+        _check("delivery.manual_approvals", data["manual_approvals"], approvals)
     confirmations = service.state.get("review_confirmations", {}).get(view["project_id"], {})
     shots = []
     folder = (Path(view["store_path"]).parent / "runs" / view["run_id"]).resolve()
@@ -394,6 +594,7 @@ def delivery_review_view(service, view, package):
         shots.append({"shot_id": sid, "preview_url": service.asset(clip["media_path"], expected_sha256=clip["media_sha256"],project_id=view["project_id"]),
             "review_status": "completed", "status": report["status"], "report": _display_report(service, summary, report,view["project_id"]),
             "report_sha256": summary["report_sha256"], "report_url": service.asset(path), "trace_id": summary.get("trace_id") or package["trace_id"],
+            "human_approved": sid in approvals, "can_approve": False, "media_sha256": clip["media_sha256"],
             "human_confirmed": confirmations.get(sid, {}).get("report_sha256") == summary["report_sha256"]})
     return {"available_count": len(shots), "total": len(view["project"]["shots"]), "reviewed_count": len(shots),
             "shots": shots, "missing_shots": [], "unknown_shots": [], "review_jobs": []}

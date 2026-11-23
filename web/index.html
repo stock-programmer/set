@@ -59,6 +59,7 @@
         <aside class="activity-rail" aria-label="后台任务与制作提示">
           <div class="activity-heading"><div><span class="eyebrow">PRODUCTION LOG</span><h2>制作动态</h2></div><span class="activity-count" id="active-job-count">0</span></div>
           <p class="activity-intro" id="activity-intro">当前故事的后台任务会在这里持续更新。</p>
+          <section id="asset-intervention" class="job-card error asset-intervention" aria-label="待你处理" hidden></section>
           <div id="job-list" class="job-list" aria-live="polite" aria-relevant="additions text"><div class="quiet-state"><span class="quiet-state-symbol" aria-hidden="true">◷</span><p>还没有任务</p><small>每一次创作，都从这里留下记录。</small></div></div>
           <section class="production-note"><span class="note-line"></span><span class="eyebrow">A NOTE ON QUALITY</span><h3>自动验收通过，再进入人工预览。</h3><p>通过、失败、待补证据分别记录。任何必过条件未知，都不会被视为验收成功。</p><div class="status-legend"><span><i class="legend-dot pass"></i>通过</span><span><i class="legend-dot fail"></i>失败</span><span><i class="legend-dot unknown"></i>未知</span></div></section>
           <div class="model-caption" id="model-caption">模型配置读取中</div>
@@ -67,6 +68,7 @@
     </div>
   </div>
   <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="false"></div>
+  <dialog id="asset-intervention-dialog" aria-labelledby="asset-intervention-title"></dialog>
   <div class="sr-only" id="screen-reader-status" role="status" aria-live="polite"></div>
 </body>
 </html>

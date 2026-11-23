@@ -125,6 +125,14 @@ async function main() {
   assert.equal(match(desk,n=>n.id==="studio-revision").value,pin.asset_id + " @ r2");
   assert.equal(walk(desk).filter(n=>n.textContent==="人工通过").length,1,"The old selected version cannot be passed in the preview");
   assert.ok(!walk(desk).some(n=>n.tagName==="img" && n.src===failedPin.media_url));
+  const previouslySelected = portrait.selected_pin;
+  portrait.selected_pin = null;
+  const reviewRow = match(run("renderStudio()"), n=>n.className==="studio-asset-problem");
+  const originalImage = match(reviewRow,n=>n.tagName==="a" && n.href===failedPin.media_url);
+  assert.equal(match(originalImage,n=>n.tagName==="img").src,failedPin.media_url);
+  assert.ok(copy(reviewRow).includes("发型要求未写明") && match(reviewRow,n=>n.textContent==="人工通过"));
+  assert.equal(requests.length,0);
+  portrait.selected_pin = previouslySelected;
   match(desk,n=>n.textContent==="重新生成").fire("click");await tick();
   assert.deepEqual(requests.pop(),{url:"/api/projects/A/studio/asset-regenerate",body:{subject_id:"lin",purpose:"portrait",feedback:"",asset_id:pin.asset_id,parent_revision:"r3"}});
   match(problem,n=>n.textContent==="查看素材与处理选项").fire("click");desk=run("renderStudio()");
@@ -241,6 +249,83 @@ async function main() {
       human_confirmed:false,report:{status:"UNKNOWN",task_complete:false,results:[{criterion_id:"action_sequence",required:true,status:"UNKNOWN",reason:"offline continuous evidence missing"}]}}]};
   desk=run("renderStudio()");
   assert.ok(copy(desk).includes("自动验收待补证据") && copy(desk).includes("Agent 待处理"));
+  const pendingShot=dto.incomplete_production.shots[0], jobId="b".repeat(32), mediaHash="c".repeat(64);
+  Object.assign(dto.incomplete_production,{request_id:"d".repeat(32),job_id:jobId});
+  Object.assign(pendingShot,{media_sha256:mediaHash,can_approve:true,
+    preview_url:`/api/projects/A/studio/progress/media?job_id=${jobId}&shot_id=S001&sha256=${mediaHash}`});
+  context.technical={...dto.incomplete_production,shots:[{...pendingShot,can_approve:false,
+    blocked_reason:"等待独立复验相邻衔接"}]};
+  const readOnly=run('studioShotApprovals(technical,"A",studioLocal("A"),true)');
+  assert.ok(copy(readOnly).includes("等待独立复验相邻衔接"));
+  assert.equal(match(readOnly,n=>n.tagName==="video" || n.attributes["aria-label"]?.startsWith("S001 待审片段")).src,pendingShot.preview_url);
+  assert.ok(!walk(readOnly).some(n=>n.textContent==="人工通过" || n.textContent==="重新检查并合片"));
+  assert.equal(match(readOnly,n=>n.dataset?.shotId==="S001").dataset.reportSha,pendingShot.report_sha256);
+  // Three shot groups, two actual outputs each. Only the selected take owns an approval action.
+  const commissionId="d".repeat(32);
+  const groups=["G001","G002","G003"].map((shotId,group) => {
+    const versions=[0,1].map(take => {
+      const media=(2*group+take+1).toString().repeat(64);
+      return {shot_id:shotId,task_id:"task-"+media,kind:take?"retake":"initial",selected:take===(group===2?1:0),media_sha256:media,
+        report_sha256:"f".repeat(64),report:{status:"FAIL",results:[{criterion_id:"action_sequence",required:true,status:"FAIL",reason:"report-"+media}]},
+        preview_url:`/api/projects/A/studio/progress/media?job_id=${jobId}&shot_id=${shotId}&sha256=${media}`};
+    });
+    return {...versions.find(take=>take.selected),versions,shot_id:shotId,request_id:commissionId,can_approve:true};
+  });
+  context.allTakes={...dto.incomplete_production,shots:groups,available_count:3,total:3,version_count:6};
+  const takeGallery=run('studioShotApprovals(allTakes,"A",studioLocal("A"),true)');
+  const cards=walk(takeGallery).filter(n=>n.className==="studio-take");
+  assert.equal(cards.length,6);assert.ok(copy(takeGallery).includes("3 个镜头组 · 6 个可播放版本"));
+  for (const [i,take] of groups.flatMap(g=>g.versions).entries()) {
+    const player=match(cards[i],n=>n.tagName==="video");
+    assert.equal(player.src,take.preview_url);
+    assert.equal(player.preload,"none");
+    assert.equal(player.dataset.takeId,take.task_id);
+    assert.ok(copy(cards[i]).includes("report-"+take.media_sha256));
+    assert.equal(cards[i].dataset.selected,String(take.selected));
+    assert.equal(walk(cards[i]).some(n=>n.textContent==="人工通过"),take.selected);
+  }
+  assert.equal(requests.length,0);
+  const src=groups[0].versions[0].preview_url, takeId=groups[0].versions[0].task_id;
+  context.players=[{src,time:0,paused:true},{src,takeId,time:7,paused:false}];
+  let plays=0, metadata;
+  context.player={dataset:{takeId},getAttribute:()=>src,readyState:0,paused:true,currentTime:0,
+    addEventListener:(name,cb)=>{assert.equal(name,"loadedmetadata");metadata=cb;},
+    play:()=>{plays++;return Promise.resolve();}};
+  run("restoreVideoPlayback(player,players)");
+  assert.equal(plays,1,"A playing take restarts before metadata arrives even when the monitor shares its URL");
+  metadata();assert.equal(context.player.currentTime,7);
+  context.player.dataset={};run("restoreVideoPlayback(player,players)");
+  assert.equal(plays,1,"The progress monitor must stay paused");
+  context.players[1].paused=true;context.player.dataset={takeId};metadata=null;
+  run("restoreVideoPlayback(player,players)");
+  assert.equal(plays,1,"Restoring an idle version must not start a media request");
+  assert.ok(metadata,"A paused take restores its position on the next user playback");
+  dto.video_execution={commission_id:commissionId,status:"failed",usage:{reserved_video_generations:6}};
+  run('var takeReads=0, previousRead=request; request=(url,opts)=>url.includes("/shot-reviews?")?(takeReads++,allTakes):previousRead(url,opts);');
+  context.allTakes.project_id="A";
+  run('renderStudio();renderStudio()');
+  await tick();
+  await tick();
+  assert.equal(run('takeReads'),1,"Render and polling share the same commission read");
+  assert.equal(walk(run('renderStudio()')).filter(n=>n.className==="studio-take").length,6);
+  assert.equal(requests.length,0);
+  run('request=previousRead;delete studioLocal("A").shotReviews');
+  delete dto.video_execution;
+  desk=run("renderStudio()");
+  let acceptShot=match(desk,n=>n.attributes["aria-label"]==="人工通过 S001 当前视频版本");
+  assert.equal(match(desk,n=>n.attributes["aria-label"]?.startsWith("S001 待审片段")).src,pendingShot.preview_url);
+  assert.equal(requests.length,0);
+  context.fakeSend=(url,dict)=>{
+    assert.equal(url,"/api/projects/A/studio/shots/approve");
+    assert.deepEqual(JSON.parse(JSON.stringify(dict.body)),{request_id:"d".repeat(32),shot_id:"S001",
+      media_sha256:mediaHash,report_sha256:"1".repeat(64)});
+    Object.assign(pendingShot,{human_approved:true,can_approve:false});
+    return {delivery:{delivered:true}};
+  };
+  await acceptShot.fire("click"); context.fakeSend=originalSend;
+  desk=run("renderStudio()");
+  assert.ok(copy(desk).includes("S001 · 已人工通过") && copy(desk).includes("offline continuous evidence missing"));
+  assert.ok(!walk(desk).some(n=>n.attributes["aria-label"]==="人工通过 S001 当前视频版本"));
   run('studioLocal("A").section="review"');desk=run("renderStudio()");
   assert.ok(copy(desk).includes("人工预览尚未解锁"));
   assert.ok(!walk(desk).some(n=>n.textContent==="确认已阅此结论"));

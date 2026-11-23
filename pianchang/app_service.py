@@ -601,19 +601,22 @@ class AppService:
 
     def _asset_job_diagnostics(self, job):
         from pianchang.asset_dispatch import ASSET_ACTIONS
-        from pianchang.asset_failure_history import read_asset_job_history
+        from pianchang.asset_diagnostics import current_image_access_guidance
+        from pianchang.asset_failure_history import legacy_model_error, project_recorded_failures, read_asset_job_history
         if job.get("kind") not in ASSET_ACTIONS or job.get("status") not in {"failed", "interrupted"} or not job.get("trace_id"):
             return None
         recorded = (job.get("result") or {}).get("asset_diagnostics")
         if recorded is not None:
-            return recorded
+            recorded = current_image_access_guidance(recorded)
+            if not any(legacy_model_error(issue) for issue in recorded.get("items") or []):
+                return recorded
         key = (job["id"], job["trace_id"])
         with self.lock:
             cached = self._asset_failure_history.get(key)
         if cached is None:
             with use_context(current_context() if (current_context() or {}).get("store_id") == self.tracer.store_id else None,
                              tracer=self.tracer):
-                cached = read_asset_job_history(self, job)
+                cached = project_recorded_failures(self, job, recorded) if recorded else read_asset_job_history(self, job)
             with self.lock:
                 self._asset_failure_history[key] = cached
         return cached
@@ -648,6 +651,9 @@ class AppService:
         if action=="studio_video":
             from pi_bridge.service import get_sessions
             return get_sessions(self).submit_production(pid,body,lambda:self._submit_task(action,pid,body,idempotency_key,library_backfill=library_backfill))
+        if action == "studio_review" and getattr(self,"_pi_sessions",None):
+            with self._pi_sessions.lock:
+                return self._submit_task(action,pid,body,idempotency_key,library_backfill=library_backfill)
         return self._submit_task(action,pid,body,idempotency_key,library_backfill=library_backfill)
 
     def _submit_task(self, action, pid, body, idempotency_key=None, *, library_backfill=False):
@@ -663,6 +669,17 @@ class AppService:
         if idempotency_key is not None and (not re.fullmatch(r"[\w-]{1,128}", idempotency_key)):
             raise ValueError("请求幂等标识无效。")
         project = None
+        if action == "asset_regenerate" and set(body) == {"resume_voice_from"}:
+            source = body["resume_voice_from"]
+            if not isinstance(source, str) or not re.fullmatch(r"[0-9a-f]{32}", source):
+                raise ValueError("原语音任务标识无效。")
+            idempotency_key = "voice-recovery-" + source
+        if action == "asset_inspect" and set(body) == {"review_voice_from", "pin"}:
+            from tools.workbench_loop_voice_review import FORMAT
+            idempotency_key = "voice-inspection-" + digest_json([body["review_voice_from"], body["pin"], FORMAT])
+        if action == "asset_production" and "resume_images_from" in body:
+            from pianchang.image_recovery import image_recovery_key
+            idempotency_key = image_recovery_key(pid, body)
         request_signature = digest_json([action, pid, body])
         # Generated reference requests acquire a parent-version pin during validation.
         # Look up the original client request first, including after that parent advanced.
@@ -714,7 +731,8 @@ class AppService:
         with self.lock:
             for previous in self.state["jobs"]:
                 if idempotency_key and previous.get("_idempotency_key") == idempotency_key:
-                    if previous["_signature"] != signature:
+                    if (previous.get("_request_signature") != request_signature if action in ASSET_ACTIONS
+                            else previous["_signature"] != signature):
                         raise ValueError("同一请求标识不能用于不同操作。")
                     event("task.reused", {"job_id": previous["id"], "trace_id": previous.get("trace_id"), "reason": "idempotency_key"}, kind="cache")
                     return next(j for j in self.list_jobs() if j["id"] == previous["id"])
@@ -723,6 +741,9 @@ class AppService:
                         event("task.reused", {"job_id": previous["id"], "trace_id": previous.get("trace_id"), "reason": "same_active_request"}, kind="cache")
                         return next(j for j in self.list_jobs() if j["id"] == previous["id"])
                     raise ValueError("此镜头已有任务，请等任务结束后再操作。")
+                if (action == "studio_review" and previous["kind"] == "pi_video" and previous.get("_pi_mode") != "inspect"
+                        and previous.get("project_id") == pid and previous["status"] in {"queued","running"}):
+                    raise ValueError("视频会话正在处理此工程，验收将等它结束后复查。")
                 if (previous["status"] in {"queued", "running"} and pid is not None
                         and previous["project_id"] == pid and (action in {"agent", "studio_video"}
                         or previous["kind"] in {"agent", "studio_video"})):
@@ -731,9 +752,20 @@ class AppService:
                    "status": "queued", "message": "已进入本地任务队列", "created_at": now(), "updated_at": now(),
                    "result": None, "error": None, "_signature": signature, "_scope": scope,
                    "_idempotency_key": idempotency_key}
+            if action == "studio_review":
+                job["review_request_id"] = body["continuation"]["request_id"]
             if action in ASSET_ACTIONS:
                 job["_request_signature"] = request_signature
                 job.update(asset_subject_id=body.get("subject_id"), asset_purpose=body.get("purpose"))
+                if body.get("resume_voice_from"):
+                    job["_voice_recovery_from"] = body["resume_voice_from"]
+                if body.get("review_voice_from"):
+                    job["_voice_inspection_from"] = body["review_voice_from"]
+                if body.get("resume_images_from"):
+                    job["_image_recovery_from"] = body["resume_images_from"]
+                    job["_image_recovery_model"] = body["model_id"]
+                    if body.get("after_authorized_review"):
+                        job["_image_revision_answer_id"] = body["after_authorized_review"]
             if action in {"story", "studio_script"}:
                 job["story_input"] = {"idea": body.get("idea") or body.get("script", {}).get("title"),
                                       **{field: body[field] for field in STORY_COUNT_FIELDS if field in body}}
@@ -751,6 +783,8 @@ class AppService:
             links = [{"trace_id": caller["trace_id"], "span_id": caller["span_id"], "relation": "submitted_by"}] if caller else []
             if body.get("repair_source", {}).get("trace_id"):
                 links.append({"trace_id": body["repair_source"]["trace_id"], "relation": "repairs"})
+            if action == "asset_production" and body.get("after_authorized_review") and body.get("revision_answer_trace_id"):
+                links.append({"trace_id":body["revision_answer_trace_id"], "relation":"authorized_by"})
             task_span = self.tracer.start_span("agent.task." + action, kind="task", new_trace=True,
                        inputs={"action": action, "project_id": pid, "body": body},
                        attributes={"job_id": job["id"], "project_id": pid, "shot_id": body.get("shot_id")}, links=links)
@@ -794,10 +828,14 @@ class AppService:
     def _update(self, job, **fields):
         with self.lock:
             context = job.get("_trace_context")
+            transition = None
             if context:
                 with use_context(context, tracer=self.tracer):
-                    event("task.transition_requested", {"job_id": job["id"], "previous_status": job["status"], "changes": fields}, kind="state")
+                    transition = event("task.transition_requested", {"job_id": job["id"], "previous_status": job["status"], "changes": fields}, kind="state")
             job.update(self.sanitize(fields), updated_at=now())
+            if fields.get("status") in {"failed","interrupted"}:
+                from tools.workbench_loop_watch import record_failure_transition
+                record_failure_transition(self.state,job,transition=transition)
             self._save()
             if context:
                 with use_context(context, tracer=self.tracer):
@@ -817,8 +855,11 @@ class AppService:
                     except CancelledError:
                         event("asset.order.predecessor_cancelled", {"job_id": previous_id}, kind="state")
                 self._execute_steps(job, body, project_hash)
-                if job.get("kind")=="studio_video" and hasattr(self,"_pi_sessions"):
-                    self._pi_sessions.release_production(job)
+                if hasattr(self,"_pi_sessions"):
+                    if job.get("kind") == "studio_video":
+                        self._pi_sessions.release_production(job)
+                    elif job.get("kind") == "studio_review":
+                        self._pi_sessions.release_review(job)
                 if (job.get("_autonomy_enabled") and job.get("status") in {"failed","interrupted"}
                         and not job.get("trace_incomplete")):
                     from pianchang.video_autonomy import enqueue_recovery
@@ -893,7 +934,7 @@ class AppService:
                     candidate = next((c for c in self._candidates(project) if c["id"] == body.get("candidate_id")), None)
                     if not candidate:
                         raise ValueError("找不到此工程的视频候选。")
-                    self._update(job, message="正在查询已有百炼任务，未重新提交生成")
+                    self._update(job, message="正在向原供应商查询已有的视频任务")
                     generated = VideoRunner(self.video_config).resume(candidate["_path"])
                     result = self._generated(pid, candidate["shot_id"], generated)
                 elif action == "check":
@@ -914,7 +955,8 @@ class AppService:
 
     def _build_story(self, job, body):
         directory = self.state_dir / "stories" / job["id"]
-        self._update(job, message="正在调用百炼编写剧本、编译分镜并检查来源与剧情状态")
+        model = self.model_routes.resolve("story.compile").model_id
+        self._update(job, message=f"正在使用 {model} 编写剧本、编译分镜并检查来源与剧情状态")
         extra = {}
         if body.get("repair_from"):
             saved = self._story_repair_source(body["repair_from"])
@@ -985,7 +1027,7 @@ class AppService:
         observation_path = inspection_path.parent.parent / "observations.json"
         observations = read_json(observation_path) if observation_path.exists() else None
         if body.get("with_model") and observations is None:
-            self._update(job, message="正在调用百炼视觉模型观察抽样帧；不能据此证明全程一致")
+            self._update(job, message=f"正在使用 {self.vision_config.model} 观察抽样帧")
             observations = observe(inspection, contract, config=self.vision_config)
             write_json(observation_path, observations)
         report = run_checks(project, contract, inspection, observations, job=candidate["_job"])

@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from pianchang.bailian_video import load_config
 from pi_bridge.diagnostics import production_diagnostics
-from trace_system import get_tracer, use_context
+from trace_system import event, get_tracer, use_context
 
 
 class PiDiagnosticsTests(unittest.TestCase):
@@ -34,11 +34,21 @@ class PiDiagnosticsTests(unittest.TestCase):
                     patch("pi_bridge.diagnostics.CollabStore") as store:
                 store.return_value.get_message.return_value={"payload":{"template":pin}}
                 store.return_value.get_asset.return_value=asset
+                with tracer.trace("test.prior_conversation") as chat:
+                    event("pi.model.receipt", {"model": "offline-text"}, kind="model")
+                service.state["jobs"].append({"id":"prior-chat", "kind":"pi_video", "session_id":session["id"],
+                    "project_id":session["project_id"], "status":"interrupted", "message":"all calls failed",
+                    "trace_id":chat.trace_id})
                 result=production_diagnostics(service,session)
                 self.assertEqual([s["image_count"] for s in result["shots"]],[8,6,5])
                 self.assertEqual([s["status"] for s in result["shots"]],["FAIL","FAIL","PASS"])
                 self.assertIn("8 张",result["shots"][0]["error"])
-                self.assertEqual(len(result["jobs"]),1)
+                self.assertEqual([j["id"] for j in result["jobs"]],["source-job", "prior-chat"])
+                self.assertEqual(result["jobs"][0]["error"], "retained original failure")
+                prior_chat = result["jobs"][1]
+                self.assertNotIn("message", prior_chat)
+                self.assertEqual(prior_chat["scope"], "conversation_without_production_handoff")
+                self.assertEqual(prior_chat["observed_model_response"]["model"], "offline-text")
                 self.assertFalse(result["preflight_ready"])
                 store.return_value.get_asset.assert_called_once_with(pin["asset_id"],pin["revision_id"])
             events=tracer.get_events(task.trace_id,names=["video.reference_check"])

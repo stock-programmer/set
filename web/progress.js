@@ -11,6 +11,7 @@
     return;
   }
   back.href += "#" + new URLSearchParams({project,step:"video"});
+  back.textContent = "返回项目审看拍摄版本 ↗";
   const monitor = studioProgressMonitor(project,job,{standalone:true,onUpdate:data=>{
     if (data.project_title) {
       document.getElementById("observer-title").textContent = data.project_title;
@@ -20,6 +21,6 @@
   panel.append(monitor.element);
   void monitor.refresh();
   const timer = window.setInterval(()=>{ if (!document.hidden) void monitor.refresh(); },5000);
-  document.addEventListener("visibilitychange",()=>{ if (!document.hidden) void monitor.refresh(); });
+  document.addEventListener("visibilitychange",()=>{ if (!document.hidden) void monitor.refresh(true); });
   window.addEventListener("pagehide",()=>window.clearInterval(timer),{once:true});
 })();

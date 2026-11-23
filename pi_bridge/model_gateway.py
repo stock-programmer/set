@@ -9,7 +9,7 @@ from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib import request, error
 
-from pianchang.bailian_text import BailianTextClient
+from pianchang.bailian_text import BailianTextClient, completion_budget, require_native_text_provider
 from pianchang.bailian_video import _trace_http_request, _trace_http_response
 from trace_system import TraceError, current_context, event, register_secret, traced, use_context
 
@@ -29,17 +29,20 @@ class ModelGateway:
         self.exchange_override = exchange
         self.failure = None
         self.failure_purpose = None
+        self.failure_summary = None
         self.calls = 0
 
     @traced("pi.model.exchange", kind="model", capture_inputs=False)
     def exchange(self, incoming, purpose="decision"):
+        if self.route is None and not self.exchange_override:
+            require_native_text_provider(self.config)
         if not self.exchange_override and (not self.api_key or self.api_key.lower() in {"your_api_key","your-api-key","sk-xxxx","replace_me"}):
             raise ValueError("所选对话模型尚未配置有效的 API Key。")
         self.before_call(incoming,purpose=purpose)
         self.calls += 1
         payload = {k: v for k, v in incoming.items() if k in {
             "messages", "tools", "tool_choice", "temperature", "top_p", "parallel_tool_calls"}}
-        payload.update(stream=False, max_tokens=self.config.max_tokens)
+        payload.update(stream=False, **completion_budget(self.route, self.config.max_tokens))
         if not isinstance(payload.get("messages"), list):
             raise ValueError("Pi model request has no messages")
         if self.route is None or self.route.adapter == "bailian":
@@ -85,7 +88,7 @@ class ModelGateway:
             except ValueError:details={}
             message=details.get("message","请查看Trace中的实际响应") if isinstance(details,dict) else str(details)
             code=details.get("code",details.get("type","")) if isinstance(details,dict) else ""
-            raise ValueError("Pi 百炼调用失败，未自动重试：HTTP " + str(exc.code)+" "+str(code)+" "+str(message)[:2000]) from None
+            raise ValueError(f"Agent 调用百炼文本模型 {self.model} 失败，未自动重试：HTTP {exc.code} {code} {str(message)[:2000]}") from None
         if len(raw) > 8 * 1024 * 1024:
             raise ValueError("Pi model response too large; outcome retained")
         return json.loads(raw)
@@ -129,9 +132,23 @@ class ModelGateway:
                     gateway.failure = exc
                     gateway.failure_purpose = purpose
                     if not isinstance(exc, TraceError):
+                        receipt = getattr(exc, "wire_receipt", None)
+                        wire = {k:receipt[k] for k in ("trace_context","wire_body_sha256","error_type","phase","dispatch")
+                                if k in receipt} if isinstance(receipt,dict) else {}
+                        not_sent = (getattr(exc, "network_dispatched", None) is False
+                                    and wire.get("dispatch") == "not_sent"
+                                    and wire.get("phase") in {"start_tls", "connect_tcp"})
+                        if not_sent:
+                            phase = "TLS 握手" if wire["phase"] == "start_tls" else "建立网络连接"
+                            gateway.failure_summary = f"模型请求在{phase}阶段中断，原请求尚未发送到供应商。"
                         with use_context(gateway.context, tracer=gateway.tracer):
-                            event("pi.model.failure", {"type": type(exc).__name__, "message": str(exc),
-                                  "purpose":purpose,"outcome": "unknown unless provider receipt proves otherwise", "automatic_retry": False}, kind="error")
+                            try:
+                                event("pi.model.failure", {"type": type(exc).__name__, "message": str(exc),
+                                      "purpose":purpose, "outcome":"not_sent" if not_sent else "unknown unless provider receipt proves otherwise",
+                                      "wire_receipt":wire, "automatic_retry":False}, kind="error")
+                            except TraceError as failure:
+                                gateway.failure = failure
+                                raise
                     self.send_error(500, "Model request stopped; inspect project Trace")
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads=True;self.server.timeout=0.25

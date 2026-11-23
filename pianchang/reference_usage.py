@@ -266,6 +266,10 @@ def _verify_reference_exchange(job, receipt, trace_id, exchange_cache=None):
         if same_task and receipt["status"] == "ACCEPTED":
             return {"status":"MATCHED_RESPONSE", **info}
         elif same_rejection and resp.get("http_status") == receipt.get("http_status"):
+            error = body.get("error", body) if isinstance(body, dict) else {}
+            if isinstance(error, dict):
+                info["provider_error"] = {k:error[k][:800] for k in ("code", "message", "param")
+                                          if isinstance(error.get(k), str)}
             return {"status":"MATCHED_RESPONSE", **info}
         elif not resp:
             matches.append({"status":"REQUEST_ONLY", **info})

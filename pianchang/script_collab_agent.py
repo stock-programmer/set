@@ -78,6 +78,7 @@ class ScriptWorkspace:
                 raise StoryError("改稿须指定已发布的基础版本。")
             _beat(script, beat_id)
         self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
         self.story_id = story_id
         self.goal = goal
         self.mode = mode
@@ -129,9 +130,9 @@ class ScriptWorkspace:
     def _save_candidate(self, candidate):
         if self.publish_started:
             raise StoryError("发布已开始，候选已冻结。")
+        _write_json(self.directory / "candidate.json", candidate)
         self.candidate = candidate
         self.report = None
-        _write_json(self.directory / "candidate.json", candidate)
         return {"candidate_sha256": digest_json(candidate), "needs_check": True}
 
     @traced("script_agent.write_draft", kind="tool")

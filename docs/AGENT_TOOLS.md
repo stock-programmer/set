@@ -33,7 +33,7 @@
 | `begin_script_revision` | — | 按用户的改稿要求，从当前版本开始修订。 | 保存基础版本、用户消息和改稿理由，重置校验状态并清空分镜候选。单纯的“继续运行”等指令会被拒绝。 | [StoryTools.begin_revision](../pi_bridge/script_tools.py#L196) |
 | `read_story_context` | 可用 | 查看原始创意、故事约束和中断位置。 | 汇总已发布剧本或候选、版本引用、数量要求、分镜格式及旧调用的中断证据。 | [StoryTools.read_context](../pi_bridge/script_tools.py#L106) |
 | `read_production_spec` | 可用 | 看已保存的分镜候选及其问题。 | 读取候选，有候选时执行即时校验，连同剧本引用、既有发布和中断记录一起返回。 | [StoryTools.read_spec](../pi_bridge/script_tools.py#L114) |
-| `patch_production_spec` | — | 定点修改分镜中的镜头、状态或来源引用。 | 将路径和值组成的 JSON 补丁应用到候选副本，禁止写入冻结的 `script_source`。按哈希留存旧候选，保存新候选并重验。 | [StoryTools.patch_spec](../pi_bridge/script_tools.py#L119) |
+| `patch_production_spec` | — | 用原生 `changes` 数组分批修改分镜，每批一个字段或镜头。 | 每项包含路径 `path` 和新值 `value`。工具保留旧候选，保存后立即重验，保护冻结的 `script_source`。旧会话仍可使用 `changes_json`。 | [StoryTools.patch_spec](../pi_bridge/script_tools.py) |
 | `check_production_spec` | 可用 | 查分镜能否追溯到原文、有无漏拍或状态矛盾。 | 嵌入冻结剧本，校验来源引用、节拍覆盖、顺序、状态及明确数量，分别报告结构问题、缺失参考和能否进入生成。 | [StoryTools.check_spec](../pi_bridge/script_tools.py#L144) |
 | `publish_production_spec` | — | 把结构合格的分镜发布为制作工程。 | 重验并发布绑定剧本版本的 `source-project`，写入工作台记录，按需调度参考资产任务。同内容可复用既有发布。缺参考时可先发布工程，拍摄仍须等参考就绪。 | [StoryTools.publish_spec](../pi_bridge/script_tools.py#L163) |
 

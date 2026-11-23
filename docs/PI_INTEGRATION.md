@@ -122,6 +122,21 @@ workspace and budget under the same Pi execution lock; the old failure trace is
 retained. `read_current_commission` is read-only. Inspect mode omits the resume
 tool. Terminal production status is saved before queued follow-ups are released.
 
+The workbench Continue button submits the selected commission ID as a structured
+user command in the existing video session. After checking the current order and
+its frozen inputs, the host hands the command to the production worker. The worker
+receives the original checkpoint and remaining budget. Conversation history and
+earlier provider errors remain available as dated evidence. In the chat interface,
+ordinary questions still use the selected conversation mode and its tool catalog.
+
+If the first Pi decision fails before production planning creates its workspace,
+an explicit Continue command may resume that same blocked order after checking
+its frozen plan and untouched checkpoint. No pending tools, video reservations,
+auxiliary model calls, repair/review records or other production files may be
+present. The original model-call count and video budget are retained. Recovery
+leaves planning pending for Pi instead of assuming `project.json` already exists;
+page reads and automatic recovery do not retry this blocked initial decision.
+
 The former generic `/api/projects/<id>/agent` start route returns HTTP 410
 `AGENT_ENTRY_MERGED`. Its UI/bookmarks lead to the video conversation. Historical
 reports and cancellation remain readable. Execution limits are read-only,
